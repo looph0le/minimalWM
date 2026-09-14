@@ -1,0 +1,14 @@
+{
+  "outer_gap": 10,
+  "inner_gap": 8,
+  "master_ratio": 0.55,
+  "toggle_key": "cmd+ctrl+space",
+  "float_apps": [
+    "System Settings",
+    "System Preferences",
+    "Calculator",
+    "Karabiner-Elements",
+    "Alfred",
+    "Spotlight"
+  ]
+}
