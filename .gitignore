@@ -1,4 +1,5 @@
 .build/
+.build-*/
 .swiftpm/
 DerivedData/
 
@@ -10,9 +11,11 @@ xcuserdata/
 *.app
 *.zip
 bin/
+dist/
 
 *.log
 *.plist
+!Packaging/Info.plist
 
 .env
 .env.*

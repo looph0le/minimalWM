@@ -1,0 +1,27 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>minimalWM adaptive icon</title>
+  <desc>Colorful master-stack window layout mark on a transparent background.</desc>
+  <defs>
+    <linearGradient id="master" x1="170" y1="170" x2="620" y2="850" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#74EBFA"/>
+      <stop offset="1" stop-color="#4D72F5"/>
+    </linearGradient>
+    <linearGradient id="stack" x1="650" y1="170" x2="880" y2="850" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B09AFF"/>
+      <stop offset="1" stop-color="#5A61D7"/>
+    </linearGradient>
+    <filter id="shadow" x="100" y="130" width="824" height="770" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="24" stdDeviation="20" flood-color="#0B1020" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <rect x="144" y="176" width="458" height="672" rx="54" fill="url(#master)"/>
+    <rect x="638" y="176" width="242" height="310" rx="48" fill="url(#stack)"/>
+    <rect x="638" y="538" width="242" height="310" rx="48" fill="url(#stack)" fill-opacity=".72"/>
+  </g>
+  <path stroke="white" stroke-linecap="round" stroke-opacity=".34" stroke-width="24" d="M204 292h338M204 354h178M204 476h268M204 538h214M204 660h302M204 722h142"/>
+  <circle cx="704" cy="250" r="18" fill="white" fill-opacity=".72"/>
+  <path stroke="white" stroke-linecap="round" stroke-opacity=".3" stroke-width="22" d="M754 250h72"/>
+  <circle cx="704" cy="612" r="18" fill="white" fill-opacity=".5"/>
+  <path stroke="white" stroke-linecap="round" stroke-opacity=".22" stroke-width="22" d="M754 612h72"/>
+</svg>

@@ -2,22 +2,22 @@
 set -euo pipefail
 
 INSTALL_DIR="/usr/local/bin"
+APP_INSTALL_DIR="/Applications"
 APP_NAME="minimalWM"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 
-echo "Building minimalWM..."
-swift build -c release 2>&1
+echo "Building universal minimalWM.app..."
+"$(dirname "$0")/Packaging/package-app.sh"
 
-BINARY=".build/arm64-apple-macosx/release/minimalWM"
+APP="$(pwd)/dist/minimalWM.app"
 
-if [ ! -f "$BINARY" ]; then
+if [ ! -x "$APP/Contents/MacOS/minimalWM" ]; then
     echo "Build failed."
     exit 1
 fi
 
-echo "Installing to $INSTALL_DIR..."
-cp "$BINARY" "$INSTALL_DIR/$APP_NAME"
-chmod +x "$INSTALL_DIR/$APP_NAME"
+echo "Installing to $APP_INSTALL_DIR..."
+ditto "$APP" "$APP_INSTALL_DIR/minimalWM.app"
 
 mkdir -p "$LAUNCH_AGENTS"
 cat > "$LAUNCH_AGENTS/com.minimalWM.plist" << EOF
@@ -29,7 +29,7 @@ cat > "$LAUNCH_AGENTS/com.minimalWM.plist" << EOF
     <string>com.minimalWM</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$INSTALL_DIR/$APP_NAME</string>
+        <string>$APP_INSTALL_DIR/minimalWM.app/Contents/MacOS/minimalWM</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -44,11 +44,11 @@ cat > "$LAUNCH_AGENTS/com.minimalWM.plist" << EOF
 EOF
 
 echo ""
-echo "Installed: $INSTALL_DIR/$APP_NAME"
+echo "Installed: $APP_INSTALL_DIR/minimalWM.app"
 echo "Launch Agent: $LAUNCH_AGENTS/com.minimalWM.plist"
 echo ""
 echo "To start now:   launchctl load $LAUNCH_AGENTS/com.minimalWM.plist"
 echo "To stop:        launchctl unload $LAUNCH_AGENTS/com.minimalWM.plist"
-echo "To uninstall:   rm $INSTALL_DIR/$APP_NAME && rm $LAUNCH_AGENTS/com.minimalWM.plist"
+echo "To uninstall:   rm -rf $APP_INSTALL_DIR/minimalWM.app && rm $LAUNCH_AGENTS/com.minimalWM.plist"
 echo ""
 echo "Grant Accessibility permission when prompted."

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/minimalwm.svg" alt="minimalWM window layout logo" width="560">
+  <img src="./assets/minimalwm-icon.svg" alt="minimalWM macOS app icon" width="220">
 </p>
 
 <h1 align="center">minimalWM</h1>
@@ -12,13 +12,7 @@
 
 minimalWM is a lightweight, native macOS tiling window manager with configurable gaps, smooth spring rearrangements, and a predictable master-stack layout. It runs locally as a menu bar app and uses macOS Accessibility APIs — no account, daemon, or network service required.
 
-## See it in action
-
-<p align="center">
-  <img src="./assets/minimalwm-demo.gif" alt="Animated preview of minimalWM rearranging a master window and stack windows" width="720">
-</p>
-
-<p align="center"><sub>Illustrative preview of the master-stack transition and spring-based rearrangement.</sub></p>
+The app icon uses transparent layered color panes so macOS can apply light, dark, and tinted treatments without a baked-in square background.
 
 ## Highlights
 
@@ -37,8 +31,20 @@ minimalWM is a lightweight, native macOS tiling window manager with configurable
 ### Requirements
 
 - macOS 14.0 or later
-- Apple Silicon with the current release script (`arm64-apple-macosx`)
+- Apple Silicon or Intel Mac; release artifacts are universal
 - Swift 6.0 toolchain
+
+### Homebrew (recommended)
+
+Once the personal tap is published:
+
+```bash
+brew tap looph0le/tap
+brew install --cask minimalwm
+open -a minimalWM
+```
+
+The cask installs a universal macOS app bundle with a native `.icns` icon. On first launch, grant **Accessibility** permission in **System Settings → Privacy & Security → Accessibility**.
 
 ### Build and install
 
@@ -48,7 +54,7 @@ cd minimalWM
 ./install.sh
 ```
 
-The installer builds a release binary, copies it to `/usr/local/bin/minimalWM`, and creates a LaunchAgent so it can start automatically. If `/usr/local/bin` is not writable, run the install command with the permissions appropriate for your machine.
+The installer builds a universal release app, installs it to `/Applications/minimalWM.app`, and creates a LaunchAgent so it can start automatically. If `/Applications` is not writable, run the install command with the permissions appropriate for your machine.
 
 ### Accessibility permission
 
@@ -70,8 +76,15 @@ launchctl unload "$HOME/Library/LaunchAgents/com.minimalWM.plist"
 To remove the installed files:
 
 ```bash
-rm /usr/local/bin/minimalWM
+rm -rf /Applications/minimalWM.app
 rm "$HOME/Library/LaunchAgents/com.minimalWM.plist"
+```
+
+To remove the Homebrew installation:
+
+```bash
+brew uninstall --cask minimalwm
+brew untap looph0le/tap
 ```
 
 ## Layout
@@ -186,9 +199,11 @@ Click the tiling icon in your menu bar to:
 For a release-style local run without installing the LaunchAgent:
 
 ```bash
-swift build -c release
-.build/arm64-apple-macosx/release/minimalWM
+./Packaging/package-app.sh
+open dist/minimalWM.app
 ```
+
+`Packaging/package-app.sh` builds arm64 and x86_64 binaries, combines them into one universal executable, generates the macOS icon family, and creates `dist/minimalWM-universal.zip` for GitHub Releases.
 
 ## Contributing
 
