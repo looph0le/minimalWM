@@ -17,6 +17,10 @@ if [ ! -x "$APP/Contents/MacOS/minimalWM" ]; then
 fi
 
 echo "Installing to $APP_INSTALL_DIR..."
+launchctl unload "$LAUNCH_AGENTS/com.minimalWM.plist" 2>/dev/null || true
+for pid in $(pgrep -x minimalWM 2>/dev/null || true); do
+    kill "$pid" 2>/dev/null || true
+done
 ditto "$APP" "$APP_INSTALL_DIR/minimalWM.app"
 
 mkdir -p "$LAUNCH_AGENTS"
@@ -29,7 +33,9 @@ cat > "$LAUNCH_AGENTS/com.minimalWM.plist" << EOF
     <string>com.minimalWM</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$APP_INSTALL_DIR/minimalWM.app/Contents/MacOS/minimalWM</string>
+        <string>/usr/bin/open</string>
+        <string>-a</string>
+        <string>$APP_INSTALL_DIR/minimalWM.app</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

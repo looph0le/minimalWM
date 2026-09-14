@@ -45,6 +45,14 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/minimalwm.icns"
 cp "$ROOT_DIR/Packaging/Info.plist" "$APP/Contents/Info.plist"
 
+# Preserve Accessibility trust across local rebuilds when the development
+# certificate from dev.sh is available. CI and external users can still use
+# the unsigned release artifact and grant permission to that installed app.
+CODESIGN_IDENTITY="${MINIMALWM_CODESIGN_IDENTITY:-MinimalWM Developer}"
+if ! codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP" 2>/dev/null; then
+    echo "Warning: $CODESIGN_IDENTITY is unavailable; leaving app ad hoc signed."
+fi
+
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$DIST_DIR/minimalWM-universal.zip"
 shasum -a 256 "$DIST_DIR/minimalWM-universal.zip" > "$DIST_DIR/minimalWM-universal.zip.sha256"
 echo "Packaged $APP"

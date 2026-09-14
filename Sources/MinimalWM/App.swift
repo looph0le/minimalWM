@@ -18,19 +18,15 @@ struct MinimalWMApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let wm = WindowManager.shared
     private let eventObserver = EventObserver()
+    private var accessibilityTimer: Timer?
+    private var servicesStarted = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if !AXBridge.requestAccessibility() {
             mwLog("minimalWM: Accessibility permission required. Grant in System Settings > Privacy & Security > Accessibility.")
             mwLog("PROMPT=1")
-        } else {
-            mwLog("minimalWM: Accessibility granted")
         }
         mwLog("minimalWM: launching pid=\(ProcessInfo.processInfo.processIdentifier)")
-
-        wm.isEnabled = true
-
-        eventObserver.start()
 
         NotificationCenter.default.addObserver(
             forName: EventObserver.windowChanged,
@@ -47,10 +43,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Initial layout pass once the app settles.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak wm] in
-            wm?.tileAll()
+        startServicesIfAuthorized()
+        if !servicesStarted {
+            accessibilityTimer = Timer.scheduledTimer(
+                withTimeInterval: 1,
+                repeats: true
+            ) { [weak self] timer in
+                guard let self else {
+                    timer.invalidate()
+                    return
+                }
+                self.startServicesIfAuthorized()
+                if self.servicesStarted {
+                    timer.invalidate()
+                    self.accessibilityTimer = nil
+                }
+            }
         }
+    }
+
+    private func startServicesIfAuthorized() {
+        guard !servicesStarted, AXIsProcessTrusted() else { return }
+        servicesStarted = true
+        mwLog("minimalWM: Accessibility granted")
+        wm.isEnabled = true
+        eventObserver.start()
 
         let hk = HotkeyManager.shared
         hk.onAction = { [weak wm] action in
@@ -75,9 +92,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         hk.start()
+
+        // Initial layout pass once the app settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak wm] in
+            wm?.tileAll()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        accessibilityTimer?.invalidate()
         eventObserver.stop()
         HotkeyManager.shared.stop()
     }
