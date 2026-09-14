@@ -67,6 +67,11 @@ final class EventObserver {
     }
 
     private func checkWindowTopology() {
+        // The snapshot below enumerates every running app's windows over
+        // synchronous AX IPC, which can stall the main run loop for tens of ms.
+        // Defer it while a tile animation is live so spring ticks stay smooth.
+        guard !WindowManager.isAnimating else { return }
+
         let snapshot = topologySnapshot()
         guard snapshot.counts != windowCounts || snapshot.identities != windowIdentities else { return }
 

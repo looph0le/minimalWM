@@ -1,12 +1,21 @@
 import Cocoa
 import CoreGraphics
+import QuartzCore
 
 @MainActor
 final class WindowManager: ObservableObject {
     static let shared = WindowManager()
 
+    // Set while the tile animation display link is live so background AX
+    // polling (EventObserver) can skip whole-application enumerations that
+    // would stall animation ticks.
+    nonisolated(unsafe) static var isAnimating = false
+
     @Published var isEnabled = false
     @Published var floatingWindows: Set<AXUIElement> = []
+    @Published var accessibilityGranted: Bool
+    @Published var floatingList: [FloatingWindowInfo] = []
+    @Published var hotkeys: [Hotkey] = []
 
     private var config: Config
     private var tileGeneration = 0
@@ -15,6 +24,8 @@ final class WindowManager: ObservableObject {
     private var dragWindow: AXUIElement?
     private var dragPID: pid_t = 0
     private var dragLastFrame: CGRect?
+    private var dragStartFrame: CGRect?
+    private var dragIsResize = false
     private var lastMoveTime = CFAbsoluteTime(0)
     private var quietTimer: Timer?
     private var dragPollTimer: Timer?
@@ -25,16 +36,18 @@ final class WindowManager: ObservableObject {
     private var dragCandidateIndex: Int?
     private var dragCandidateSamples = 0
     private var dragHasValidDrop = false
-    private var frameAnimationTimer: Timer?
+    private var animationDisplayLink: CADisplayLink?
     private var animationStates: [AXUIElement: WindowAnimationState] = [:]
     private var animationWindows: Set<AXUIElement> = []
     private var animationPIDs: Set<pid_t> = []
+    private var animationEnhancedPIDs: Set<pid_t> = []
     private var animationStartedAt = CFAbsoluteTime(0)
     private var lastAnimationTickAt = CFAbsoluteTime(0)
     private var animationTickCount = 0
     private var animationWriteCount = 0
     private var animationSlowTickCount = 0
     private var animationWriteTime = TimeInterval(0)
+    private var animationWriteCursor = 0
     private var displayOrders: [String: [ManagedWindowKey]] = [:]
     private var displayElements: [ManagedWindowKey: AXUIElement] = [:]
     private let dragConfirmInterval: TimeInterval = 0.25
@@ -43,14 +56,35 @@ final class WindowManager: ObservableObject {
     private let dragAnimationDuration: TimeInterval = 0.14
     private let frameAnimationInterval: TimeInterval = 1.0 / 120.0
     private let dragHysteresis: CGFloat = 24
+    // Position frames are disseminated at display rate while each window is
+    // round-robined so motion stays fluid without saturating Accessibility.
+    private let animationWriteInterval: TimeInterval = 1.0 / 120.0
+    private let animationWriteDelta: CGFloat = 0.2
+    // Size bounds ride the same cadence as position (a single ~1ms setSize
+    // IPC) so width/height keep pace with the glide. They are written alone —
+    // never in the same tick as that window's position write — so the spring
+    // position already anchors the window while its bounds change.
+    private let animationWriteSizeDelta: CGFloat = 0.75
+    // Spread writes across ticks so N windows never block the run loop in a
+    // single frame — the reason multi-window swaps used to stutter.
+    private let animationMaxWritesPerTick = 3
+    private let animationWriteTimeBudget: TimeInterval = 0.004
 
     private struct WindowAnimationState {
         var frame: CGRect
         var lastWrittenFrame: CGRect
         var lastWriteAt: CFAbsoluteTime
+        var lastSizeWriteAt: CFAbsoluteTime
         var velocity: CGVector
         var sizeVelocity: CGSize
         var target: CGRect
+    }
+
+    struct FloatingWindowInfo: Identifiable {
+        let id: Int
+        let element: AXUIElement
+        let app: String
+        let title: String
     }
 
     private struct ManagedWindowKey: Hashable {
@@ -65,6 +99,9 @@ final class WindowManager: ObservableObject {
         self.innerGap = config.innerGap
         self.isGapsSynced = config.syncGaps
         self.masterRatio = config.masterRatio
+        self.newWindowAsMaster = config.newWindowPosition != "stack"
+        self.accessibilityGranted = AXIsProcessTrusted()
+        self.hotkeys = HotkeyManager.shared.hotkeys
     }
 
     nonisolated func loadConfig() {
@@ -74,6 +111,9 @@ final class WindowManager: ObservableObject {
             self.innerGap = config.innerGap
             self.isGapsSynced = config.syncGaps
             self.masterRatio = config.masterRatio
+            self.newWindowAsMaster = config.newWindowPosition != "stack"
+            self.reloadFloatsFromConfig()
+            self.reloadHotkeys()
             self.tileAll()
         }
     }
@@ -95,6 +135,7 @@ final class WindowManager: ObservableObject {
     @Published var innerGap: CGFloat
     @Published var isGapsSynced: Bool
     @Published var masterRatio: CGFloat
+    @Published var newWindowAsMaster: Bool
 
     func setOuterGap(_ v: CGFloat) {
         if isGapsSynced {
@@ -141,6 +182,13 @@ final class WindowManager: ObservableObject {
         config.masterRatio = clamped
         masterRatio = clamped
         applyTilesNow()
+    }
+
+    func setNewWindowAsMaster(_ enabled: Bool) {
+        newWindowAsMaster = enabled
+        config.newWindowPosition = enabled ? "master" : "stack"
+        applyTilesNow()
+        commitConfig()
     }
 
     func commitConfig() {
@@ -234,10 +282,10 @@ final class WindowManager: ObservableObject {
         // Ignore movement notifications only for windows currently written by
         // the animation loop. A time-based global suppression can swallow the
         // first real drag event after a layout settles.
-        if frameAnimationTimer != nil, animationWindows.contains(window) {
+        if animationDisplayLink != nil, animationWindows.contains(window) {
             return
         }
-        if frameAnimationTimer != nil,
+        if animationDisplayLink != nil,
            dragWindow == nil,
            animationPIDs.contains(AXBridge.pid(of: window)) {
             return
@@ -287,6 +335,7 @@ final class WindowManager: ObservableObject {
         dragOrder = windows
         dragOriginalOrder = windows
         dragDisplayFrame = displayFrame
+        dragStartFrame = frame
         dragPreviewIndex = windows.firstIndex(of: dragged)
         dragCandidateIndex = nil
         dragCandidateSamples = 0
@@ -347,6 +396,18 @@ final class WindowManager: ObservableObject {
                       CGPoint(x: draggedFrame.midX, y: draggedFrame.midY)
                   )
               }) else { return }
+
+        // An edge/corner resize changes the window size while keeping its
+        // origin roughly anchored. That is not a reorder — keep the dragged
+        // window under the user's control and suppress preview animations.
+        if let start = dragStartFrame,
+           isResizeDrag(start, draggedFrame) {
+            dragIsResize = true
+            dragHasValidDrop = false
+            dragCandidateIndex = nil
+            dragCandidateSamples = 0
+            return
+        }
 
         let frame = LayoutEngine.visibleFrameInCG(for: screen)
         if let previousFrame = dragDisplayFrame,
@@ -445,34 +506,37 @@ final class WindowManager: ObservableObject {
         }
         guard inWorkArea else { return nil }
 
-        if currentIndex == 0 {
-            if center.x < masterBoundary + dragHysteresis {
-                return 0
-            }
-        } else if center.x < masterBoundary - dragHysteresis {
+        // Resolve the column first. A hysteresis band around the master/stack
+        // divider locks the dragged window to its current column so crossing
+        // the boundary does not flicker, then projects onto the exact slot.
+        if center.x < masterBoundary - dragHysteresis {
             return 0
-        } else if center.x > masterBoundary - dragHysteresis {
-            let stackIndex = stack.enumerated().min {
-                abs(center.y - $0.element.frame.midY) < abs(center.y - $1.element.frame.midY)
-            }?.offset ?? 0
-            return stackIndex + 1
+        }
+        if center.x > masterBoundary + dragHysteresis {
+            return nearestStackIndex(for: center, in: stack) + 1
         }
 
-        if currentIndex == 0 {
-            return center.x <= masterBoundary ? 0 : 1
-        }
-
-        let currentStackIndex = currentIndex - 1
-        guard currentStackIndex < stack.count else { return nil }
-        let currentSlot = stack[currentStackIndex].frame
+        // Inside the divider hysteresis band — keep the dragged column stable.
+        guard currentIndex > 0 else { return 0 }
+        let currentSlot = stack[currentIndex - 1].frame
         if abs(center.y - currentSlot.midY) <= currentSlot.height / 2 + dragHysteresis {
             return currentIndex
         }
+        return nearestStackIndex(for: center, in: stack) + 1
+    }
 
-        let targetStackIndex = stack.enumerated().min {
+    private func nearestStackIndex(for center: CGPoint, in stack: [LayoutEngine.Tile]) -> Int {
+        stack.enumerated().min {
             abs(center.y - $0.element.frame.midY) < abs(center.y - $1.element.frame.midY)
-        }?.offset ?? currentStackIndex
-        return targetStackIndex + 1
+        }?.offset ?? 0
+    }
+
+    private func isResizeDrag(_ start: CGRect, _ now: CGRect) -> Bool {
+        let sizeDelta = max(
+            abs(start.width - now.width),
+            abs(start.height - now.height)
+        )
+        return sizeDelta > 30
     }
 
     private func resetDragState() {
@@ -481,6 +545,8 @@ final class WindowManager: ObservableObject {
         dragWindow = nil
         dragPID = 0
         dragLastFrame = nil
+        dragStartFrame = nil
+        dragIsResize = false
         dragOrder = []
         dragOriginalOrder = []
         dragDisplayFrame = nil
@@ -491,11 +557,16 @@ final class WindowManager: ObservableObject {
     }
 
     private func stopAnimations() {
-        frameAnimationTimer?.invalidate()
-        frameAnimationTimer = nil
+        animationDisplayLink?.invalidate()
+        animationDisplayLink = nil
         animationStates.removeAll()
         animationWindows.removeAll()
         animationPIDs.removeAll()
+        for pid in animationEnhancedPIDs {
+            AXBridge.setEnhancedUI(pid: pid, enabled: true)
+        }
+        animationEnhancedPIDs.removeAll()
+        Self.isAnimating = false
         suppressUntil = 0
     }
 
@@ -534,6 +605,14 @@ final class WindowManager: ObservableObject {
 
     private func handleDrop(of dragged: AXUIElement) {
         guard isEnabled else { return }
+
+        // The user resized the window rather than moving it: restore the
+        // layout so the window snaps back into its tile.
+        if dragIsResize {
+            resetDragState()
+            tileAll()
+            return
+        }
 
         guard let draggedFrame = AXBridge.frame(of: dragged) else {
             tileAll()
@@ -619,6 +698,7 @@ final class WindowManager: ObservableObject {
                     frame: current,
                     lastWrittenFrame: current,
                     lastWriteAt: 0,
+                    lastSizeWriteAt: 0,
                     velocity: .zero,
                     sizeVelocity: .zero,
                     target: target
@@ -630,7 +710,17 @@ final class WindowManager: ObservableObject {
             suppressUntil = CFAbsoluteTimeGetCurrent() + duration + 0.1
         }
 
-        guard frameAnimationTimer == nil else { return }
+        guard animationDisplayLink == nil else { return }
+
+        // Relax enhanced UI once for the whole animation. While relaxed, size
+        // writes in the tick loop bypass the per-write enhanced UI round trip
+        // (5–8 ms each) and stay cheap enough to run at display rate. Restored
+        // when the animation settles or is cancelled.
+        animationEnhancedPIDs = []
+        for pid in animationPIDs where AXBridge.isEnhancedUIEnabled(pid: pid) {
+            AXBridge.setEnhancedUI(pid: pid, enabled: false)
+            animationEnhancedPIDs.insert(pid)
+        }
 
         animationStartedAt = CFAbsoluteTimeGetCurrent()
         lastAnimationTickAt = animationStartedAt
@@ -638,187 +728,234 @@ final class WindowManager: ObservableObject {
         animationWriteCount = 0
         animationSlowTickCount = 0
         animationWriteTime = 0
+        animationWriteCursor = 0
         if isDebugEnabled {
             mwLog("minimalWM: animation started windows=\(targets.count) targetDurationMs=\(Int(duration * 1000))")
         }
 
-        let animationTimer = Timer(timeInterval: frameAnimationInterval, repeats: true) {
-            [weak self] timer in
-            guard let self else {
-                timer.invalidate()
-                return
-            }
+        guard let screen = NSScreen.main else { return }
+        let link = screen.displayLink(target: self, selector: #selector(animationTick(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        link.isPaused = false
+        link.add(to: .main, forMode: .common)
+        animationDisplayLink = link
+        Self.isAnimating = true
+    }
 
-            let tickStartedAt = CFAbsoluteTimeGetCurrent()
-            let tickInterval = tickStartedAt - self.lastAnimationTickAt
-            self.lastAnimationTickAt = tickStartedAt
-            self.animationTickCount += 1
-            if tickInterval > 0.0167 {
-                self.animationSlowTickCount += 1
-            }
-
-            // Accessibility writes can block the main run loop. Advance by
-            // actual elapsed time so the spring remains time-consistent.
-            let dt = min(max(tickInterval, self.frameAnimationInterval), 0.033)
-            // A critically damped spring gives a fast, elastic response while
-            // avoiding visible bounce when a target changes mid-flight.
-            let stiffness: CGFloat = 625
-            let damping: CGFloat = 50 // 2 * sqrt(stiffness)
-            // Size changes use a softer spring so an app has time to redraw
-            // its content as its bounds change, instead of visibly snapping.
-            let sizeStiffness: CGFloat = 400
-            let sizeDamping: CGFloat = 40 // 2 * sqrt(sizeStiffness)
-            var settled = true
-
-            for (window, var state) in self.animationStates {
-                let previousFrame = state.frame
-                let (x, vx) = springStep(
-                    value: state.frame.origin.x,
-                    velocity: state.velocity.dx,
-                    target: state.target.origin.x,
-                    stiffness: stiffness,
-                    damping: damping,
-                    dt: dt
-                )
-                let (y, vy) = springStep(
-                    value: state.frame.origin.y,
-                    velocity: state.velocity.dy,
-                    target: state.target.origin.y,
-                    stiffness: stiffness,
-                    damping: damping,
-                    dt: dt
-                )
-                let (width, widthVelocity) = springStep(
-                    value: state.frame.width,
-                    velocity: state.sizeVelocity.width,
-                    target: state.target.width,
-                    stiffness: sizeStiffness,
-                    damping: sizeDamping,
-                    dt: dt
-                )
-                let (height, heightVelocity) = springStep(
-                    value: state.frame.height,
-                    velocity: state.sizeVelocity.height,
-                    target: state.target.height,
-                    stiffness: sizeStiffness,
-                    damping: sizeDamping,
-                    dt: dt
-                )
-
-                state.frame.origin.x = x
-                state.frame.origin.y = y
-                state.frame.size.width = width
-                state.frame.size.height = height
-                state.velocity = CGVector(dx: vx, dy: vy)
-                state.sizeVelocity = CGSize(width: widthVelocity, height: heightVelocity)
-
-                state.frame.origin.x = clampedSpringValue(
-                    previous: previousFrame.origin.x,
-                    value: state.frame.origin.x,
-                    target: state.target.origin.x
-                )
-                state.frame.origin.y = clampedSpringValue(
-                    previous: previousFrame.origin.y,
-                    value: state.frame.origin.y,
-                    target: state.target.origin.y
-                )
-                state.frame.size.width = clampedSpringValue(
-                    previous: previousFrame.width,
-                    value: state.frame.width,
-                    target: state.target.width
-                )
-                state.frame.size.height = clampedSpringValue(
-                    previous: previousFrame.height,
-                    value: state.frame.height,
-                    target: state.target.height
-                )
-
-                let positionDistance = hypot(
-                    state.target.origin.x - state.frame.origin.x,
-                    state.target.origin.y - state.frame.origin.y
-                )
-                let sizeDistance = hypot(
-                    state.target.width - state.frame.width,
-                    state.target.height - state.frame.height
-                )
-                let speed = hypot(state.velocity.dx, state.velocity.dy)
-                let sizeSpeed = hypot(state.sizeVelocity.width, state.sizeVelocity.height)
-
-                if positionDistance < 0.5 && sizeDistance < 0.5 && speed < 8 && sizeSpeed < 8 {
-                    state.frame = state.target
-                    state.velocity = .zero
-                    state.sizeVelocity = .zero
-                } else {
-                    settled = false
-                }
-
-                let writeDelta = max(
-                    abs(state.lastWrittenFrame.origin.x - state.frame.origin.x),
-                    abs(state.lastWrittenFrame.origin.y - state.frame.origin.y),
-                    abs(state.lastWrittenFrame.width - state.frame.width),
-                    abs(state.lastWrittenFrame.height - state.frame.height)
-                )
-                let now = CFAbsoluteTimeGetCurrent()
-                // Limit synchronous AX writes to about 30 Hz per window. The
-                // spring remains continuous while the main run loop stays
-                // responsive to drag events.
-                let canWrite = now - state.lastWriteAt >= 1.0 / 30.0
-                if writeDelta > 0.75 && canWrite {
-                    let writeStartedAt = CFAbsoluteTimeGetCurrent()
-                    let sizeDelta = max(
-                        abs(state.lastWrittenFrame.width - state.frame.width),
-                        abs(state.lastWrittenFrame.height - state.frame.height)
-                    )
-                    AXBridge.setFrame(
-                        window,
-                        to: state.frame,
-                        writeSize: sizeDelta > 1.5,
-                        reinforcePosition: false
-                    )
-                    self.animationWriteTime += CFAbsoluteTimeGetCurrent() - writeStartedAt
-                    self.animationWriteCount += 1
-                    state.lastWrittenFrame = state.frame
-                    state.lastWriteAt = now
-                }
-                self.animationStates[window] = state
-            }
-
-            if settled {
-                for (window, state) in self.animationStates {
-                    let finalDelta = max(
-                        abs(state.lastWrittenFrame.origin.x - state.target.origin.x),
-                        abs(state.lastWrittenFrame.origin.y - state.target.origin.y),
-                        abs(state.lastWrittenFrame.width - state.target.width),
-                        abs(state.lastWrittenFrame.height - state.target.height)
-                    )
-                    if finalDelta > 0.5 {
-                        AXBridge.setFrame(window, to: state.target)
-                    }
-                }
-                let elapsed = CFAbsoluteTimeGetCurrent() - self.animationStartedAt
-                if isDebugEnabled {
-                    let averageTickMs = self.animationTickCount > 0
-                        ? (elapsed / Double(self.animationTickCount)) * 1000
-                        : 0
-                    let averageWriteMs = self.animationWriteCount > 0
-                        ? (self.animationWriteTime / Double(self.animationWriteCount)) * 1000
-                        : 0
-                    mwLog(
-                        "minimalWM: animation settled elapsedMs=\(Int(elapsed * 1000)) " +
-                        "ticks=\(self.animationTickCount) avgTickMs=\(String(format: "%.2f", averageTickMs)) " +
-                        "slowTicks=\(self.animationSlowTickCount) writes=\(self.animationWriteCount) " +
-                        "avgWriteMs=\(String(format: "%.2f", averageWriteMs))"
-                    )
-                }
-                timer.invalidate()
-                self.frameAnimationTimer = nil
-                self.animationStates.removeAll()
-                self.animationWindows.removeAll()
-                self.animationPIDs.removeAll()
-            }
+    @objc private func animationTick(_ link: CADisplayLink) {
+        let tickStartedAt = CFAbsoluteTimeGetCurrent()
+        let tickInterval = tickStartedAt - lastAnimationTickAt
+        lastAnimationTickAt = tickStartedAt
+        animationTickCount += 1
+        if tickInterval > 0.0167 {
+            animationSlowTickCount += 1
         }
-        frameAnimationTimer = animationTimer
-        RunLoop.main.add(animationTimer, forMode: .common)
+
+        // Accessibility writes can block the main run loop. Advance by actual
+        // elapsed time so the spring remains time-consistent.
+        let dt = min(max(tickInterval, frameAnimationInterval), 0.033)
+        // A critically damped spring gives a fast, elastic response while
+        // avoiding visible bounce when a target changes mid-flight.
+        let stiffness: CGFloat = 625
+        let damping: CGFloat = 50 // 2 * sqrt(stiffness)
+        // Size uses the same dynamics as position so a window's width and
+        // height converge in step with its glide — no trailing "resize slowly
+        // catches up" feel during a swap or gap change.
+        let sizeStiffness: CGFloat = 625
+        let sizeDamping: CGFloat = 50 // 2 * sqrt(sizeStiffness)
+        var settled = true
+
+        for (window, var state) in animationStates {
+            let previousFrame = state.frame
+            let (x, vx) = springStep(
+                value: state.frame.origin.x,
+                velocity: state.velocity.dx,
+                target: state.target.origin.x,
+                stiffness: stiffness,
+                damping: damping,
+                dt: dt
+            )
+            let (y, vy) = springStep(
+                value: state.frame.origin.y,
+                velocity: state.velocity.dy,
+                target: state.target.origin.y,
+                stiffness: stiffness,
+                damping: damping,
+                dt: dt
+            )
+            let (width, widthVelocity) = springStep(
+                value: state.frame.width,
+                velocity: state.sizeVelocity.width,
+                target: state.target.width,
+                stiffness: sizeStiffness,
+                damping: sizeDamping,
+                dt: dt
+            )
+            let (height, heightVelocity) = springStep(
+                value: state.frame.height,
+                velocity: state.sizeVelocity.height,
+                target: state.target.height,
+                stiffness: sizeStiffness,
+                damping: sizeDamping,
+                dt: dt
+            )
+
+            state.frame.origin.x = x
+            state.frame.origin.y = y
+            state.frame.size.width = width
+            state.frame.size.height = height
+            state.velocity = CGVector(dx: vx, dy: vy)
+            state.sizeVelocity = CGSize(width: widthVelocity, height: heightVelocity)
+
+            state.frame.origin.x = clampedSpringValue(
+                previous: previousFrame.origin.x,
+                value: state.frame.origin.x,
+                target: state.target.origin.x
+            )
+            state.frame.origin.y = clampedSpringValue(
+                previous: previousFrame.origin.y,
+                value: state.frame.origin.y,
+                target: state.target.origin.y
+            )
+            state.frame.size.width = clampedSpringValue(
+                previous: previousFrame.width,
+                value: state.frame.width,
+                target: state.target.width
+            )
+            state.frame.size.height = clampedSpringValue(
+                previous: previousFrame.height,
+                value: state.frame.height,
+                target: state.target.height
+            )
+
+            let positionDistance = hypot(
+                state.target.origin.x - state.frame.origin.x,
+                state.target.origin.y - state.frame.origin.y
+            )
+            let sizeDistance = hypot(
+                state.target.width - state.frame.width,
+                state.target.height - state.frame.height
+            )
+            let speed = hypot(state.velocity.dx, state.velocity.dy)
+            let sizeSpeed = hypot(state.sizeVelocity.width, state.sizeVelocity.height)
+
+            if positionDistance < 0.5 && sizeDistance < 0.5 && speed < 12 && sizeSpeed < 12 {
+                state.frame = state.target
+                state.velocity = .zero
+                state.sizeVelocity = .zero
+            } else {
+                settled = false
+            }
+
+            animationStates[window] = state
+        }
+
+        writeAnimationFrames()
+
+        if settled {
+            for (window, state) in animationStates {
+                let finalDelta = max(
+                    abs(state.lastWrittenFrame.origin.x - state.target.origin.x),
+                    abs(state.lastWrittenFrame.origin.y - state.target.origin.y),
+                    abs(state.lastWrittenFrame.width - state.target.width),
+                    abs(state.lastWrittenFrame.height - state.target.height)
+                )
+                if finalDelta > 0.5 {
+                    AXBridge.setFrame(window, to: state.target)
+                }
+            }
+            for pid in animationEnhancedPIDs {
+                AXBridge.setEnhancedUI(pid: pid, enabled: true)
+            }
+            animationEnhancedPIDs.removeAll()
+            let elapsed = CFAbsoluteTimeGetCurrent() - animationStartedAt
+            if isDebugEnabled {
+                let averageTickMs = animationTickCount > 0
+                    ? (elapsed / Double(animationTickCount)) * 1000
+                    : 0
+                let averageWriteMs = animationWriteCount > 0
+                    ? (animationWriteTime / Double(animationWriteCount)) * 1000
+                    : 0
+                mwLog(
+                    "minimalWM: animation settled elapsedMs=\(Int(elapsed * 1000)) " +
+                    "ticks=\(animationTickCount) avgTickMs=\(String(format: "%.2f", averageTickMs)) " +
+                    "slowTicks=\(animationSlowTickCount) writes=\(animationWriteCount) " +
+                    "avgWriteMs=\(String(format: "%.2f", averageWriteMs))"
+                )
+            }
+            link.invalidate()
+            animationDisplayLink = nil
+            animationStates.removeAll()
+            animationWindows.removeAll()
+            animationPIDs.removeAll()
+            animationWriteCursor = 0
+            Self.isAnimating = false
+        }
+    }
+
+    private func writeAnimationFrames() {
+        let windows = Array(animationStates.keys)
+        guard !windows.isEmpty else { return }
+
+        let passStartedAt = CFAbsoluteTimeGetCurrent()
+        var writes = 0
+        var index = animationWriteCursor
+        var visited = 0
+        while visited < windows.count {
+            let window = windows[index % windows.count]
+            index += 1
+            visited += 1
+
+            guard var state = animationStates[window] else { continue }
+            let now = CFAbsoluteTimeGetCurrent()
+            let positionDelta = max(
+                abs(state.lastWrittenFrame.origin.x - state.frame.origin.x),
+                abs(state.lastWrittenFrame.origin.y - state.frame.origin.y)
+            )
+            let sizeDelta = max(
+                abs(state.lastWrittenFrame.width - state.frame.width),
+                abs(state.lastWrittenFrame.height - state.frame.height)
+            )
+
+            // Position frames ride the display link while a window is moving;
+            // each write is a single ~1ms AX IPC. Enhanced UI was relaxed once
+            // at animation start so these bypass the per-write round trip.
+            if positionDelta > animationWriteDelta,
+               now - state.lastWriteAt >= animationWriteInterval {
+                let started = CFAbsoluteTimeGetCurrent()
+                AXBridge.setFrame(
+                    window,
+                    to: state.frame,
+                    writeSize: false,
+                    reinforcePosition: false,
+                    manageEnhancedUI: false
+                )
+                animationWriteTime += CFAbsoluteTimeGetCurrent() - started
+                animationWriteCount += 1
+                state.lastWrittenFrame.origin = state.frame.origin
+                state.lastWriteAt = now
+                writes += 1
+            }
+
+            // Size bounds ride the same cadence as position — a single
+            // ~2ms setSize IPC — so width/height keep pace with the glide.
+            // The budget and write cap naturally cap per-tick IPCs.
+            if sizeDelta > animationWriteSizeDelta,
+               now - state.lastSizeWriteAt >= animationWriteInterval {
+                let started = CFAbsoluteTimeGetCurrent()
+                AXBridge.setSize(window, to: state.frame.size)
+                animationWriteTime += CFAbsoluteTimeGetCurrent() - started
+                animationWriteCount += 1
+                state.lastWrittenFrame.size = state.frame.size
+                state.lastSizeWriteAt = now
+                writes += 1
+            }
+
+            animationStates[window] = state
+            if writes >= animationMaxWritesPerTick { break }
+            if CFAbsoluteTimeGetCurrent() - passStartedAt > animationWriteTimeBudget { break }
+        }
+        animationWriteCursor = index % max(windows.count, 1)
     }
 
     private func clampedSpringValue(
@@ -920,7 +1057,83 @@ final class WindowManager: ObservableObject {
         } else {
             floatingWindows.insert(current)
         }
+        refreshFloatingList()
+        persistFloats()
         tileAll()
+    }
+
+    func unfloat(_ window: AXUIElement) {
+        floatingWindows.remove(window)
+        refreshFloatingList()
+        persistFloats()
+        applyTilesNow()
+    }
+
+    func unfloatAll() {
+        guard !floatingWindows.isEmpty else { return }
+        floatingWindows.removeAll()
+        refreshFloatingList()
+        persistFloats()
+        applyTilesNow()
+    }
+
+    func refreshAccessibilityStatus() {
+        accessibilityGranted = AXIsProcessTrusted()
+    }
+
+    func reloadHotkeys() {
+        HotkeyManager.shared.rebuildFromConfig()
+        hotkeys = HotkeyManager.shared.hotkeys
+    }
+
+    func reloadFloatsFromConfig() {
+        guard config.floatingWindows.isEmpty == false else {
+            floatingWindows.removeAll()
+            refreshFloatingList()
+            return
+        }
+        var matched: Set<AXUIElement> = []
+        let running = AXBridge.runningApps()
+        for descriptor in config.floatingWindows {
+            for app in running where app.localizedName == descriptor.app {
+                for window in AXBridge.windows(for: app.processIdentifier)
+                where AXBridge.title(of: window) == descriptor.title {
+                    matched.insert(window)
+                }
+            }
+        }
+        floatingWindows = matched
+        refreshFloatingList()
+    }
+
+    private func refreshFloatingList() {
+        let runningPIDs = Set(AXBridge.runningApps().map(\.processIdentifier))
+        let pruned = floatingWindows.filter { window in
+            runningPIDs.contains(AXBridge.pid(of: window))
+                && AXBridge.frame(of: window) != nil
+        }
+        if pruned != floatingWindows {
+            floatingWindows = pruned
+        }
+        floatingList = pruned
+            .map { window in
+                let pid = AXBridge.pid(of: window)
+                let app = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "Unknown"
+                return FloatingWindowInfo(
+                    id: window.hashValue,
+                    element: window,
+                    app: app,
+                    title: AXBridge.title(of: window) ?? "Window"
+                )
+            }
+            .sorted { ($0.app, $0.title) < ($1.app, $1.title) }
+    }
+
+    private func persistFloats() {
+        config.floatingWindows = floatingList.map {
+            FloatingWindowDescriptor(app: $0.app, title: $0.title)
+        }
+        config.save()
     }
 
     // MARK: - Private
@@ -950,7 +1163,14 @@ final class WindowManager: ObservableObject {
 
         let existing = order.filter { currentSet.contains($0) }
         let newKeys = currentKeys.filter { !order.contains($0) }
-        order = newKeys + existing
+        // New-window insertion is a deliberate choice: the master column keeps
+        // the most recently created window front; the stack option appends to
+        // the bottom so users who prefer stable column positions can opt out.
+        if config.newWindowPosition == "stack" {
+            order = existing + newKeys
+        } else {
+            order = newKeys + existing
+        }
         displayOrders[displayKey] = order
 
         return order.compactMap { displayElements[$0] }
@@ -1061,23 +1281,21 @@ final class WindowManager: ObservableObject {
     }
 
     private func swapFocusedWindow(direction: Int) {
-        guard let current = focusedWindow() else { return }
+        guard let current = focusedWindow(), let mainScreen = NSScreen.main else { return }
         let all = allTiledOnCurrentDisplay()
         guard let currentIndex = all.firstIndex(of: current) else { return }
 
         let targetIndex = currentIndex + direction
         guard targetIndex >= 0 && targetIndex < all.count else { return }
 
-        let target = all[targetIndex]
-        let currentFrame = AXBridge.frame(of: current)
-        let targetFrame = AXBridge.frame(of: target)
+        // Exchange the logical order so the spring engine slides both windows
+        // to each other's tile instead of hard-setting their frames.
+        var reordered = all
+        reordered.swapAt(currentIndex, targetIndex)
 
-        if let cf = currentFrame, let tf = targetFrame {
-            AXBridge.setFrame(target, to: cf)
-            AXBridge.setFrame(current, to: tf)
-        }
-
+        let frame = LayoutEngine.visibleFrameInCG(for: mainScreen)
+        persistOrder(reordered, for: mainScreen)
         _ = AXUIElementPerformAction(current, kAXRaiseAction as CFString)
-        tileAll()
+        animateTiles(reordered, in: frame, duration: dragAnimationDuration)
     }
 }

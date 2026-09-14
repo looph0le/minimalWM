@@ -3,6 +3,18 @@ import Cocoa
 
 struct AXBridge {
 
+    nonisolated(unsafe) static var lastDebugWindowDumpAt: CFAbsoluteTime = 0
+
+    // Dumping every window on every tiledWindows() call floods the log and
+    // starves the main run loop in debug builds. Cap topology dumps at 1/s.
+    static func shouldLogWindowTopology() -> Bool {
+        guard isDebugEnabled else { return false }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastDebugWindowDumpAt >= 1.0 else { return false }
+        lastDebugWindowDumpAt = now
+        return true
+    }
+
     static func requestAccessibility() -> Bool {
         if AXIsProcessTrusted() { return true }
         AXIsProcessTrustedWithOptions(
@@ -94,16 +106,36 @@ struct AXBridge {
 
     // MARK: - Write
 
+    static func isEnhancedUIEnabled(pid: pid_t) -> Bool {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            appElement(pid: pid),
+            "AXEnhancedUserInterface" as CFString,
+            &ref
+        ) == .success else { return false }
+        return (ref as? Bool) ?? false
+    }
+
+    static func setEnhancedUI(pid: pid_t, enabled: Bool) {
+        AXUIElementSetAttributeValue(
+            appElement(pid: pid),
+            "AXEnhancedUserInterface" as CFString,
+            enabled ? kCFBooleanTrue : kCFBooleanFalse
+        )
+    }
+
     static func setFrame(
         _ element: AXUIElement,
         to rect: CGRect,
         writeSize: Bool = true,
-        reinforcePosition: Bool = true
+        reinforcePosition: Bool = true,
+        // The per-write enhanced UI round trip lets apps that are already in
+        // enhanced mode accept geometry changes, but it is synchronous and can
+        // block the run loop for 5–8 ms. Animations relax enhanced mode once
+        // up front and pass false here to keep every intermediate write cheap.
+        manageEnhancedUI: Bool = true
     ) {
-        // Intermediate animation ticks only need a position write. Avoid the
-        // app-level enhanced UI round trip on those writes; it is synchronous
-        // and can block the main run loop for several milliseconds.
-        let needsEnhancedUIHandling = writeSize || reinforcePosition
+        let needsEnhancedUIHandling = manageEnhancedUI && (writeSize || reinforcePosition)
         var wasEnhanced = false
         if needsEnhancedUIHandling {
             let app = appElement(pid: pid(of: element))
@@ -139,14 +171,14 @@ struct AXBridge {
     }
 
     @discardableResult
-    private static func setPosition(_ element: AXUIElement, to point: CGPoint) -> AXError {
+    static func setPosition(_ element: AXUIElement, to point: CGPoint) -> AXError {
         var p = point
         guard let val = AXValueCreate(.cgPoint, &p) else { return .failure }
         return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, val)
     }
 
     @discardableResult
-    private static func setSize(_ element: AXUIElement, to size: CGSize) -> AXError {
+    static func setSize(_ element: AXUIElement, to size: CGSize) -> AXError {
         var s = size
         guard let val = AXValueCreate(.cgSize, &s) else { return .failure }
         return AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, val)
@@ -168,7 +200,7 @@ struct AXBridge {
                 let sub = subrole(window)
                 let wf = frame(of: window)
 
-                if isDebugEnabled {
+                if shouldLogWindowTopology() {
                     let title = title(of: window) ?? ""
                     let identifier = identifier(of: window) ?? ""
                     print("[debug] \(appName): win=\(String(describing: wf)) subrole=\(String(describing: sub)) id=\(identifier) title=\(title) minimized=\(isMin) fullscreen=\(isFS)")

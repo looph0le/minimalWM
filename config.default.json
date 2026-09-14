@@ -1,8 +1,17 @@
 {
   "outer_gap": 10,
   "inner_gap": 8,
+  "sync_gaps": false,
   "master_ratio": 0.55,
   "toggle_key": "cmd+ctrl+space",
+  "focus_left_key": "cmd+ctrl+h",
+  "focus_right_key": "cmd+ctrl+l",
+  "swap_left_key": "cmd+ctrl+shift+h",
+  "swap_right_key": "cmd+ctrl+shift+l",
+  "grow_master_key": "cmd+ctrl+k",
+  "shrink_master_key": "cmd+ctrl+j",
+  "float_key": "cmd+ctrl+f",
+  "new_window_position": "master",
   "float_apps": [
     "System Settings",
     "System Preferences",
@@ -10,5 +19,6 @@
     "Karabiner-Elements",
     "Alfred",
     "Spotlight"
-  ]
+  ],
+  "floating_windows": []
 }

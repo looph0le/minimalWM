@@ -18,6 +18,7 @@ struct Hotkey: Equatable {
     let keyCode: UInt16
     let modifiers: CGEventFlags
     let action: Action
+    var display: String
 
     func matches(_ code: UInt16, _ flags: CGEventFlags) -> Bool {
         keyCode == code && modifiers == flags
@@ -31,16 +32,16 @@ final class HotkeyManager {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var retainedSelf: Unmanaged<HotkeyManager>?
+    private(set) var hotkeys: [Hotkey] = []
 
     var onAction: ((Hotkey.Action) -> Void)?
-    private var hotkeys: [Hotkey] = []
 
     private init() {}
 
     func start() {
         guard eventTap == nil else { return }
 
-        hotkeys = buildHotkeys()
+        hotkeys = buildHotkeys(from: Config.load())
 
         let eventMask = CGEventMask((1 << CGEventType.keyDown.rawValue))
         let callback: CGEventTapCallBack = { _, type, event, refcon in
@@ -71,6 +72,15 @@ final class HotkeyManager {
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
+    // Rebuilds the active hotkey set from the current config so menu help and
+    // the event tap always agree with ~/.config/minimalWM/config.json.
+    func rebuildFromConfig() {
+        let built = buildHotkeys(from: Config.load())
+        if built != hotkeys {
+            hotkeys = built
+        }
+    }
+
     func stop() {
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -83,6 +93,8 @@ final class HotkeyManager {
         eventTap = nil
         runLoopSource = nil
     }
+
+    // MARK: - Event tap
 
     private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -107,19 +119,88 @@ final class HotkeyManager {
         return Unmanaged.passUnretained(event)
     }
 
-    private func buildHotkeys() -> [Hotkey] {
+    // MARK: - Configuration
 
-        let cmdCtrl: CGEventFlags = [.maskCommand, .maskControl]
-
-        return [
-            Hotkey(name: "Toggle Tiling", keyCode: UInt16(kVK_Space), modifiers: cmdCtrl, action: .toggleTiling),
-            Hotkey(name: "Focus Left", keyCode: UInt16(kVK_ANSI_H), modifiers: cmdCtrl, action: .focusLeft),
-            Hotkey(name: "Focus Right", keyCode: UInt16(kVK_ANSI_L), modifiers: cmdCtrl, action: .focusRight),
-            Hotkey(name: "Swap Left", keyCode: UInt16(kVK_ANSI_H), modifiers: cmdCtrl.union(.maskShift), action: .swapLeft),
-            Hotkey(name: "Swap Right", keyCode: UInt16(kVK_ANSI_L), modifiers: cmdCtrl.union(.maskShift), action: .swapRight),
-            Hotkey(name: "Grow Master", keyCode: UInt16(kVK_ANSI_J), modifiers: cmdCtrl, action: .growMaster),
-            Hotkey(name: "Shrink Master", keyCode: UInt16(kVK_ANSI_K), modifiers: cmdCtrl, action: .shrinkMaster),
-            Hotkey(name: "Toggle Float", keyCode: UInt16(kVK_ANSI_F), modifiers: cmdCtrl, action: .toggleFloat),
+    private func buildHotkeys(from config: Config) -> [Hotkey] {
+        var result: [Hotkey] = []
+        let entries: [((Config) -> String, String, Hotkey.Action)] = [
+            ({ $0.toggleKey }, "Toggle Tiling", .toggleTiling),
+            ({ $0.focusLeftKey }, "Focus Left", .focusLeft),
+            ({ $0.focusRightKey }, "Focus Right", .focusRight),
+            ({ $0.swapLeftKey }, "Swap Left", .swapLeft),
+            ({ $0.swapRightKey }, "Swap Right", .swapRight),
+            ({ $0.growMasterKey }, "Grow Master", .growMaster),
+            ({ $0.shrinkMasterKey }, "Shrink Master", .shrinkMaster),
+            ({ $0.toggleFloatKey }, "Toggle Float", .toggleFloat),
         ]
+        for (combo, name, action) in entries {
+            guard let parsed = Self.parseCombo(combo(config)) else { continue }
+            result.append(Hotkey(
+                name: name,
+                keyCode: parsed.keyCode,
+                modifiers: parsed.modifiers,
+                action: action,
+                display: parsed.display
+            ))
+        }
+        return result
+    }
+
+    struct ParsedCombo {
+        let keyCode: UInt16
+        let modifiers: CGEventFlags
+        let display: String
+    }
+
+    static func parseCombo(_ raw: String) -> ParsedCombo? {
+        let parts = raw.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let keyPart = parts.last, !parts.isEmpty else { return nil }
+
+        var flags: CGEventFlags = []
+        var symbols: [String] = []
+        for modifier in parts.dropLast() {
+            switch modifier {
+            case "cmd", "command":
+                flags.insert(.maskCommand)
+                symbols.append("⌘")
+            case "ctrl", "control":
+                flags.insert(.maskControl)
+                symbols.append("⌃")
+            case "alt", "option", "opt":
+                flags.insert(.maskAlternate)
+                symbols.append("⌥")
+            case "shift":
+                flags.insert(.maskShift)
+                symbols.append("⇧")
+            default:
+                return nil
+            }
+        }
+
+        guard let keyCode = keyCode(for: keyPart) else { return nil }
+        return ParsedCombo(
+            keyCode: keyCode,
+            modifiers: flags,
+            display: symbols.joined() + keySymbol(for: keyPart)
+        )
+    }
+
+    private static func keyCode(for key: String) -> UInt16? {
+        if key == "space" {
+            return UInt16(kVK_Space)
+        }
+        if key.count == 1, let ascii = key.lowercased().unicodeScalars.first?.value {
+            if ascii >= 97 && ascii <= 122 {
+                return UInt16(Int(kVK_ANSI_A) + Int(ascii - 97))
+            }
+            if ascii >= 48 && ascii <= 57 {
+                return UInt16(Int(kVK_ANSI_0) + Int(ascii - 48))
+            }
+        }
+        return nil
+    }
+
+    private static func keySymbol(for key: String) -> String {
+        key == "space" ? "Space" : key.uppercased()
     }
 }

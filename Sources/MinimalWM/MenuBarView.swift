@@ -11,9 +11,14 @@ struct MenuBarView: View {
 
             toggle
 
-            if wm.isEnabled {
+            if !wm.accessibilityGranted {
+                Divider()
+                accessibilityOnboarding
+            } else if wm.isEnabled {
                 Divider()
                 layoutControls
+                Divider()
+                floatingSection
                 Divider()
                 hotkeyHelp
             }
@@ -29,26 +34,72 @@ struct MenuBarView: View {
             .buttonStyle(.plain)
         }
         .padding(16)
-        .frame(width: 280)
+        .frame(width: 300)
     }
 
     private var header: some View {
         HStack(spacing: 10) {
-            Image(systemName: "rectangle.split.2x2")
+            Image(systemName: wm.isEnabled ? "rectangle.split.2x2.fill" : "rectangle.split.2x2")
                 .font(.title3)
                 .foregroundStyle(wm.isEnabled ? Color.accentColor : Color.secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text("minimalWM")
                     .font(.system(.headline, design: .rounded).weight(.semibold))
-                Text(wm.isEnabled ? "Tiling is active" : "Tiling is paused")
+                Text(statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             Circle()
-                .fill(wm.isEnabled ? Color.green : Color.gray)
+                .fill(statusColor)
                 .frame(width: 9, height: 9)
         }
+    }
+
+    private var statusText: String {
+        if !wm.accessibilityGranted {
+            return "Accessibility permission needed"
+        }
+        return wm.isEnabled ? "Tiling is active" : "Tiling is paused"
+    }
+
+    private var statusColor: Color {
+        if !wm.accessibilityGranted {
+            return Color.orange
+        }
+        return wm.isEnabled ? Color.green : Color.gray
+    }
+
+    private var accessibilityOnboarding: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("Accessibility Permission")
+            Text("minimalWM reads and arranges other apps' windows, which macOS only allows with Accessibility access.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                openAccessibilitySettings()
+            } label: {
+                Label("Open System Settings", systemImage: "cursorarrow.click.2")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            Button {
+                wm.refreshAccessibilityStatus()
+            } label: {
+                Text("Check Again")
+                    .font(.caption)
+            }
+            .buttonStyle(.plain)
+            Text("Grant permission for minimalWM, then click Check Again — no restart needed.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func openAccessibilitySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private var layoutControls: some View {
@@ -56,6 +107,23 @@ struct MenuBarView: View {
             sectionTitle("Layout")
             masterSlider
             gapControls
+            newWindowToggle
+        }
+    }
+
+    private var newWindowToggle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("New window becomes master", isOn: Binding(
+                get: { wm.newWindowAsMaster },
+                set: { wm.setNewWindowAsMaster($0) }
+            ))
+            .toggleStyle(.switch)
+            .font(.caption)
+            Text(wm.newWindowAsMaster
+                 ? "New windows take the master slot; existing windows cycle down."
+                 : "New windows join the end of the stack; positions stay put.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -90,12 +158,63 @@ struct MenuBarView: View {
             HStack {
                 Text(wm.isEnabled ? "Disable Tiling" : "Enable Tiling")
                 Spacer()
-                Text("⌘⌃ Space")
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
+                if let toggleHotkey = wm.hotkeys.first(where: { $0.action == .toggleTiling }) {
+                    Text(toggleHotkey.display)
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                }
             }
         }
         .buttonStyle(.plain)
+    }
+
+    private var floatingSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                sectionTitle("Floating Windows")
+                Spacer()
+                if !wm.floatingList.isEmpty {
+                    Button("Clear All") { wm.unfloatAll() }
+                        .buttonStyle(.plain)
+                        .font(.caption)
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            if wm.floatingList.isEmpty {
+                Text("Press \(floatKeyHint) to float the focused window.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(wm.floatingList) { info in
+                    HStack(spacing: 6) {
+                        Image(systemName: "pin.slash")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(info.title)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(info.app)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Unfloat") { wm.unfloat(info.element) }
+                            .buttonStyle(.plain)
+                            .font(.caption)
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                Text("Floats are remembered across restarts.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var floatKeyHint: String {
+        wm.hotkeys.first(where: { $0.action == .toggleFloat })?.display ?? "⌘⌃ F"
     }
 
     private var masterSlider: some View {
@@ -140,10 +259,9 @@ struct MenuBarView: View {
     private var hotkeyHelp: some View {
         VStack(alignment: .leading, spacing: 3) {
             sectionTitle("Shortcuts")
-            hotkey("⌘⌃ H / L", "focus left / right")
-            hotkey("⌘⌃⇧ H / L", "swap left / right")
-            hotkey("⌘⌃ J / K", "shrink / grow master")
-            hotkey("⌘⌃ F", "toggle float")
+            ForEach(Array(wm.hotkeys.enumerated()), id: \.offset) { _, hk in
+                hotkey(hk.display, hk.name)
+            }
         }
     }
 

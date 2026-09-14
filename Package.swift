@@ -15,6 +15,7 @@ let package = Package(
                 .linkedFramework("Cocoa"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("ApplicationServices"),
+                .linkedFramework("QuartzCore"),
             ]
         )
     ]

@@ -123,6 +123,9 @@ The manager tiles macOS windows, not browser tabs. A new Safari or Ghostty tab c
 | `⌘⌃ J / K` | Shrink / grow master area |
 | `⌘⌃ F` | Toggle float on focused window |
 
+Every hotkey can be rebound in `config.json` (see below); the menu bar
+reference updates to reflect the active bindings.
+
 ## Configuration
 
 Config file: `~/.config/minimalWM/config.json`
@@ -134,9 +137,20 @@ Config file: `~/.config/minimalWM/config.json`
   "sync_gaps": false,
   "master_ratio": 0.55,
   "toggle_key": "cmd+ctrl+space",
+  "focus_left_key": "cmd+ctrl+h",
+  "focus_right_key": "cmd+ctrl+l",
+  "swap_left_key": "cmd+ctrl+shift+h",
+  "swap_right_key": "cmd+ctrl+shift+l",
+  "grow_master_key": "cmd+ctrl+k",
+  "shrink_master_key": "cmd+ctrl+j",
+  "float_key": "cmd+ctrl+f",
+  "new_window_position": "master",
   "float_apps": [
     "System Settings",
     "Calculator"
+  ],
+  "floating_windows": [
+    { "app": "Notes", "title": "Ideas" }
   ]
 }
 ```
@@ -147,9 +161,20 @@ Config file: `~/.config/minimalWM/config.json`
 | `inner_gap` | `8` | Space between adjacent windows (px) |
 | `sync_gaps` | `false` | Keep outer and inner gaps equal; editing either gap disables sync |
 | `master_ratio` | `0.55` | Master window width as fraction of available space (0.25–0.75) |
+| `toggle_key` | `cmd+ctrl+space` | Toggle tiling hotkey |
+| `focus_left_key` / `focus_right_key` | `cmd+ctrl+h` / `cmd+ctrl+l` | Focus hotkeys |
+| `swap_left_key` / `swap_right_key` | `cmd+ctrl+shift+h` / `cmd+ctrl+shift+l` | Swap hotkeys |
+| `grow_master_key` / `shrink_master_key` | `cmd+ctrl+k` / `cmd+ctrl+j` | Master grow / shrink hotkeys |
+| `float_key` | `cmd+ctrl+f` | Toggle float on focused window |
+| `new_window_position` | `master` | Where a newly opened window lands: `master` (becomes master, others cycle down) or `stack` (appended to the end of the stack) |
 | `float_apps` | `[]` | App names to exclude from tiling |
+| `floating_windows` | `[]` | Windows kept floating across restarts (managed from the menu bar) |
 
-Changes are applied immediately when saved.
+Hotkey strings combine modifiers (`cmd`, `ctrl`, `alt`, `shift`) with a key
+(`a`–`z`, `0`–`9`, or `space`) using `+`, e.g. `ctrl+alt+m`.
+
+Changes are applied immediately when saved, and floating-window state
+persists across restarts.
 
 ## Troubleshooting
 

@@ -7,10 +7,21 @@ struct MinimalWMApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        MenuBarExtra("minimalWM", systemImage: "rectangle.split.2x2") {
+        MenuBarExtra {
             MenuBarView()
+        } label: {
+            MenuBarLabel()
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+struct MenuBarLabel: View {
+    @ObservedObject private var wm = WindowManager.shared
+
+    var body: some View {
+        Image(systemName: wm.isEnabled ? "rectangle.split.2x2.fill" : "rectangle.split.2x2")
+            .symbolRenderingMode(.hierarchical)
     }
 }
 
@@ -18,11 +29,14 @@ struct MinimalWMApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let wm = WindowManager.shared
     private let eventObserver = EventObserver()
+    private let configWatcher = ConfigWatcher()
     private var accessibilityTimer: Timer?
     private var servicesStarted = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        wm.refreshAccessibilityStatus()
         if !AXBridge.requestAccessibility() {
+            wm.refreshAccessibilityStatus()
             mwLog("minimalWM: Accessibility permission required. Grant in System Settings > Privacy & Security > Accessibility.")
             mwLog("PROMPT=1")
         }
@@ -43,6 +57,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Apply config edits while the app runs, matching the documented
+        // "changes apply immediately when saved" behavior.
+        configWatcher.start()
+
         startServicesIfAuthorized()
         if !servicesStarted {
             accessibilityTimer = Timer.scheduledTimer(
@@ -62,11 +80,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // User likely just returned from System Settings; refresh permission
+        // state so the onboarding UI clears without a restart.
+        wm.refreshAccessibilityStatus()
+    }
+
     private func startServicesIfAuthorized() {
         guard !servicesStarted, AXIsProcessTrusted() else { return }
         servicesStarted = true
         mwLog("minimalWM: Accessibility granted")
+        wm.accessibilityGranted = true
         wm.isEnabled = true
+        wm.reloadFloatsFromConfig()
+        wm.reloadHotkeys()
         eventObserver.start()
 
         let hk = HotkeyManager.shared
@@ -101,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         accessibilityTimer?.invalidate()
+        configWatcher.stop()
         eventObserver.stop()
         HotkeyManager.shared.stop()
     }
