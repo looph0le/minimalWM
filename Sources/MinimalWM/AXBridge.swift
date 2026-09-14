@@ -60,6 +60,14 @@ struct AXBridge {
         return ref as? String
     }
 
+    static func identifier(of element: AXUIElement) -> String? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, "AXIdentifier" as CFString, &ref) == .success else {
+            return nil
+        }
+        return ref as? String
+    }
+
     static func isMinimized(_ element: AXUIElement) -> Bool {
         var ref: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXMinimizedAttribute as CFString, &ref) == .success else { return false }
@@ -86,23 +94,46 @@ struct AXBridge {
 
     // MARK: - Write
 
-    static func setFrame(_ element: AXUIElement, to rect: CGRect) {
-        let pid = pid(of: element)
-        let app = appElement(pid: pid)
-
-        var enhancedUI: CFTypeRef?
-        let wasEnhanced = AXUIElementCopyAttributeValue(app, "AXEnhancedUserInterface" as CFString, &enhancedUI) == .success
-            && (enhancedUI as? Bool) == true
-
-        if wasEnhanced {
-            AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanFalse)
+    static func setFrame(
+        _ element: AXUIElement,
+        to rect: CGRect,
+        writeSize: Bool = true,
+        reinforcePosition: Bool = true
+    ) {
+        // Intermediate animation ticks only need a position write. Avoid the
+        // app-level enhanced UI round trip on those writes; it is synchronous
+        // and can block the main run loop for several milliseconds.
+        let needsEnhancedUIHandling = writeSize || reinforcePosition
+        var wasEnhanced = false
+        if needsEnhancedUIHandling {
+            let app = appElement(pid: pid(of: element))
+            var enhancedUI: CFTypeRef?
+            wasEnhanced = AXUIElementCopyAttributeValue(
+                app,
+                "AXEnhancedUserInterface" as CFString,
+                &enhancedUI
+            ) == .success && (enhancedUI as? Bool) == true
+            if wasEnhanced {
+                AXUIElementSetAttributeValue(
+                    app,
+                    "AXEnhancedUserInterface" as CFString,
+                    kCFBooleanFalse
+                )
+            }
         }
 
+        if writeSize {
+            // Apply bounds before position so the window is not briefly
+            // resized around its old origin during a tile transition.
+            setSize(element, to: rect.size)
+        }
         setPosition(element, to: rect.origin)
-        setSize(element, to: rect.size)
-        setPosition(element, to: rect.origin)
+        if reinforcePosition {
+            setPosition(element, to: rect.origin)
+        }
 
-        if wasEnhanced {
+        if needsEnhancedUIHandling, wasEnhanced {
+            let app = appElement(pid: pid(of: element))
             AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
         }
     }
@@ -138,7 +169,9 @@ struct AXBridge {
                 let wf = frame(of: window)
 
                 if isDebugEnabled {
-                    print("[debug] \(appName): win=\(String(describing: wf)) subrole=\(String(describing: sub)) minimized=\(isMin) fullscreen=\(isFS)")
+                    let title = title(of: window) ?? ""
+                    let identifier = identifier(of: window) ?? ""
+                    print("[debug] \(appName): win=\(String(describing: wf)) subrole=\(String(describing: sub)) id=\(identifier) title=\(title) minimized=\(isMin) fullscreen=\(isFS)")
                     fflush(stdout)
                 }
 

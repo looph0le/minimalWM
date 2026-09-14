@@ -1,19 +1,58 @@
-# minimalWM
+<p align="center">
+  <img src="./assets/minimalwm.svg" alt="minimalWM window layout logo" width="560">
+</p>
+
+<h1 align="center">minimalWM</h1>
+
+<p align="center">A focused, smooth master-stack tiling window manager for macOS.</p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-14%2B-111827?logo=apple)](https://www.apple.com/macos/)
+[![Swift](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)](https://www.swift.org/)
 
-A minimal tiling window manager for macOS with configurable gaps.
+minimalWM is a lightweight, native macOS tiling window manager with configurable gaps, smooth spring rearrangements, and a predictable master-stack layout. It runs locally as a menu bar app and uses macOS Accessibility APIs — no account, daemon, or network service required.
 
-Automatically arranges windows in a master-stack layout with inner and outer gaps. Runs as a menu bar app — one click to toggle, zero config to start.
+## See it in action
+
+<p align="center">
+  <img src="./assets/minimalwm-demo.gif" alt="Animated preview of minimalWM rearranging a master window and stack windows" width="720">
+</p>
+
+<p align="center"><sub>Illustrative preview of the master-stack transition and spring-based rearrangement.</sub></p>
+
+## Highlights
+
+- Native Swift executable for macOS
+- Master-stack layout with a configurable master ratio
+- Independent inner and outer gaps
+- Per-display logical ordering that is not derived from window coordinates
+- New windows become master; existing windows cycle down the stack
+- Spring-based drag previews and smooth resize transitions
+- Manual drag placement persists until you change the order again
+- Menu bar controls for toggling, gaps, master width, and shortcuts
+- Floating-app exclusions and native multi-display support
 
 ## Install
+
+### Requirements
+
+- macOS 14.0 or later
+- Apple Silicon with the current release script (`arm64-apple-macosx`)
+- Swift 6.0 toolchain
+
+### Build and install
 
 ```bash
 git clone https://github.com/looph0le/minimalWM.git
 cd minimalWM
-swift build -c release
 ./install.sh
 ```
+
+The installer builds a release binary, copies it to `/usr/local/bin/minimalWM`, and creates a LaunchAgent so it can start automatically. If `/usr/local/bin` is not writable, run the install command with the permissions appropriate for your machine.
+
+### Accessibility permission
+
+On first launch, open **System Settings → Privacy & Security → Accessibility** and enable `minimalWM`. The permission is required because the window manager reads and updates other applications' window frames.
 
 ## Run
 
@@ -21,9 +60,19 @@ swift build -c release
 minimalWM
 ```
 
-On first launch, you will be prompted to grant **Accessibility** permission in *System Settings → Privacy & Security → Accessibility*.
+To start or stop the installed LaunchAgent manually:
 
-The app controls other applications through macOS Accessibility APIs. It runs locally and does not require an account, network service, or remote backend.
+```bash
+launchctl load "$HOME/Library/LaunchAgents/com.minimalWM.plist"
+launchctl unload "$HOME/Library/LaunchAgents/com.minimalWM.plist"
+```
+
+To remove the installed files:
+
+```bash
+rm /usr/local/bin/minimalWM
+rm "$HOME/Library/LaunchAgents/com.minimalWM.plist"
+```
 
 ## Layout
 
@@ -43,6 +92,9 @@ The app controls other applications through macOS Accessibility APIs. It runs lo
 - One master window on the left (~55% width, configurable)
 - Remaining windows split the right column equally
 - Gaps between all windows and around screen edges
+- New windows become the master on the display where they appear; existing windows cycle down the stack
+
+The manager tiles macOS windows, not browser tabs. A new Safari or Ghostty tab changes the existing window's title but does not create another tiled window; opening a separate window does.
 
 ## Hotkeys
 
@@ -82,6 +134,28 @@ Config file: `~/.config/minimalWM/config.json`
 
 Changes are applied immediately when saved.
 
+## Troubleshooting
+
+### Windows are not tiling
+
+Confirm that `minimalWM` is enabled under **System Settings → Privacy & Security → Accessibility**, then toggle tiling with `⌘⌃ Space`. Apps listed in `float_apps` are intentionally excluded.
+
+### A window is floating during a drag
+
+The window under the pointer remains under user control while dragging. Other windows preview the destination, and the dragged window is placed only after the mouse button is released.
+
+### Safari tabs are not rearranging independently
+
+macOS Accessibility exposes Safari windows rather than individual tabs. Create a new Safari window if you want another tiled item.
+
+### Reset the configuration
+
+```bash
+rm "$HOME/.config/minimalWM/config.json"
+```
+
+The default configuration is recreated on the next launch.
+
 ## Menu Bar
 
 Click the tiling icon in your menu bar to:
@@ -96,6 +170,7 @@ Click the tiling icon in your menu bar to:
 - Observes window events (create, move, resize, close) via AXObserver to re-tile automatically
 - Polls Accessibility window topology twice per second as a fallback for missed events
 - Respects macOS native workspaces — tiles per-display, per-space
+- Maintains a separate logical master-stack order for each display instead of deriving order from current window coordinates
 - Handles Chromium/Electron apps via the AXEnhancedUserInterface workaround
 - Drag previews use directional slot boundaries with a small hysteresis band to avoid order flicker
 - The dragged window is left under user control until release; empty-space drops restore the prior order
@@ -107,6 +182,13 @@ Click the tiling icon in your menu bar to:
 ```
 
 `dev.sh` optionally uses a local codesigning identity named `MinimalWM Developer` to preserve Accessibility trust across rebuilds. This identity is not included with the project and is not required for release builds.
+
+For a release-style local run without installing the LaunchAgent:
+
+```bash
+swift build -c release
+.build/arm64-apple-macosx/release/minimalWM
+```
 
 ## Contributing
 

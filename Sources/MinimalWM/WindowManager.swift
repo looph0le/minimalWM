@@ -13,18 +13,33 @@ final class WindowManager: ObservableObject {
     private var suppressUntil: CFAbsoluteTime = 0
 
     private var dragWindow: AXUIElement?
+    private var dragPID: pid_t = 0
+    private var dragLastFrame: CGRect?
     private var lastMoveTime = CFAbsoluteTime(0)
     private var quietTimer: Timer?
+    private var dragPollTimer: Timer?
     private var dragOrder: [AXUIElement] = []
     private var dragOriginalOrder: [AXUIElement] = []
     private var dragDisplayFrame: CGRect?
     private var dragPreviewIndex: Int?
+    private var dragCandidateIndex: Int?
+    private var dragCandidateSamples = 0
     private var dragHasValidDrop = false
     private var frameAnimationTimer: Timer?
     private var animationStates: [AXUIElement: WindowAnimationState] = [:]
     private var animationWindows: Set<AXUIElement> = []
+    private var animationPIDs: Set<pid_t> = []
+    private var animationStartedAt = CFAbsoluteTime(0)
+    private var lastAnimationTickAt = CFAbsoluteTime(0)
+    private var animationTickCount = 0
+    private var animationWriteCount = 0
+    private var animationSlowTickCount = 0
+    private var animationWriteTime = TimeInterval(0)
+    private var displayOrders: [String: [ManagedWindowKey]] = [:]
+    private var displayElements: [ManagedWindowKey: AXUIElement] = [:]
     private let dragConfirmInterval: TimeInterval = 0.25
     private let dragQuietInterval: TimeInterval = 0.3
+    private let dragPollInterval: TimeInterval = 1.0 / 60.0
     private let dragAnimationDuration: TimeInterval = 0.14
     private let frameAnimationInterval: TimeInterval = 1.0 / 120.0
     private let dragHysteresis: CGFloat = 24
@@ -32,9 +47,16 @@ final class WindowManager: ObservableObject {
     private struct WindowAnimationState {
         var frame: CGRect
         var lastWrittenFrame: CGRect
+        var lastWriteAt: CFAbsoluteTime
         var velocity: CGVector
         var sizeVelocity: CGSize
         var target: CGRect
+    }
+
+    private struct ManagedWindowKey: Hashable {
+        let pid: pid_t
+        let identity: String
+        let subrole: String
     }
 
     private init() {
@@ -146,12 +168,11 @@ final class WindowManager: ObservableObject {
         let activeDisplays = DisplayTracker.currentDisplays()
         for screen in activeDisplays {
             let frame = LayoutEngine.visibleFrameInCG(for: screen)
-            let windows = AXBridge.tiledWindows(on: frame, floatApps: config.floatApps)
-                .filter { AXBridge.pid(of: $0.element) != ProcessInfo.processInfo.processIdentifier }
+            let windows = orderedWindows(on: frame, screen: screen)
 
             guard gen == tileGeneration else { return }
 
-            let elements = windows.map(\.element)
+            let elements = windows
             let dragged = dragWindow
             if layoutNeedsUpdate(elements, in: frame, config: config, excluding: dragged) {
                 animateTiles(
@@ -193,10 +214,32 @@ final class WindowManager: ObservableObject {
     private func handleMove(of window: AXUIElement) {
         let now = CFAbsoluteTimeGetCurrent()
 
+        // Safari and some other applications briefly expose title-bar
+        // elements as AXUnknown while a real window is being moved. They are
+        // not valid drag sources and must never start a drag session.
+        guard AXBridge.subrole(window) == "AXStandardWindow",
+              let frame = AXBridge.frame(of: window),
+              frame.width > 100,
+              frame.height > 100 else {
+            return
+        }
+
+        // Ignore notifications emitted by the manager immediately after an
+        // animation settles. The short grace period prevents the final AX
+        // write from being interpreted as a fresh user drag.
+        if dragWindow == nil, now < suppressUntil {
+            return
+        }
+
         // Ignore movement notifications only for windows currently written by
         // the animation loop. A time-based global suppression can swallow the
         // first real drag event after a layout settles.
         if frameAnimationTimer != nil, animationWindows.contains(window) {
+            return
+        }
+        if frameAnimationTimer != nil,
+           dragWindow == nil,
+           animationPIDs.contains(AXBridge.pid(of: window)) {
             return
         }
 
@@ -210,6 +253,7 @@ final class WindowManager: ObservableObject {
         // the preview responsive and use a quiet period to detect the drop.
         if let dragged = dragWindow, dragged == window {
             lastMoveTime = now
+            dragLastFrame = AXBridge.frame(of: window) ?? dragLastFrame
             updateDragPreview(of: dragged)
             scheduleQuietCheck(interval: dragQuietInterval)
             return
@@ -221,6 +265,7 @@ final class WindowManager: ObservableObject {
             mwLog("minimalWM: drag started pid=\(AXBridge.pid(of: window))")
         }
         lastMoveTime = now
+        dragLastFrame = AXBridge.frame(of: window)
         updateDragPreview(of: window)
         scheduleQuietCheck(interval: dragConfirmInterval)
     }
@@ -237,18 +282,62 @@ final class WindowManager: ObservableObject {
               }
 
         let displayFrame = LayoutEngine.visibleFrameInCG(for: screen)
-        let windows = AXBridge.tiledWindows(on: displayFrame, floatApps: config.floatApps)
-            .map(\.element)
-            .filter {
-                AXBridge.pid(of: $0) != ProcessInfo.processInfo.processIdentifier
-                    && !floatingWindows.contains($0)
-            }
+        let windows = orderedWindows(on: displayFrame, screen: screen)
 
         dragOrder = windows
         dragOriginalOrder = windows
         dragDisplayFrame = displayFrame
         dragPreviewIndex = windows.firstIndex(of: dragged)
+        dragCandidateIndex = nil
+        dragCandidateSamples = 0
         dragHasValidDrop = false
+        dragPID = AXBridge.pid(of: dragged)
+        startDragPolling()
+    }
+
+    private func startDragPolling() {
+        dragPollTimer?.invalidate()
+        let timer = Timer(timeInterval: dragPollInterval, repeats: true) { [weak self] _ in
+            self?.pollDraggedWindow()
+        }
+        dragPollTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func pollDraggedWindow() {
+        guard let dragged = dragWindow else {
+            dragPollTimer?.invalidate()
+            dragPollTimer = nil
+            return
+        }
+
+        guard let frame = AXBridge.frame(of: dragged) else {
+            if dragPID != 0,
+               let replacement = AXBridge.windows(for: dragPID).first(where: {
+                   AXBridge.subrole($0) == "AXStandardWindow"
+               }) {
+                let previous = dragged
+                dragWindow = replacement
+                dragLastFrame = AXBridge.frame(of: replacement)
+                dragOrder = dragOrder.map { $0 == previous ? replacement : $0 }
+                dragOriginalOrder = dragOriginalOrder.map { $0 == previous ? replacement : $0 }
+                dragPreviewIndex = dragOrder.firstIndex(of: replacement)
+                if isDebugEnabled {
+                    mwLog("minimalWM: drag AX element recovered pid=\(dragPID)")
+                }
+                updateDragPreview(of: replacement)
+            }
+            return
+        }
+
+        guard dragLastFrame != frame else { return }
+        dragLastFrame = frame
+        lastMoveTime = CFAbsoluteTimeGetCurrent()
+        updateDragPreview(of: dragWindow ?? dragged)
+        scheduleQuietCheck(interval: dragQuietInterval)
+        if isDebugEnabled {
+            mwLog("minimalWM: drag polled frame=\(Int(frame.minX)),\(Int(frame.minY)),\(Int(frame.width)),\(Int(frame.height))")
+        }
     }
 
     private func updateDragPreview(of dragged: AXUIElement) {
@@ -262,26 +351,20 @@ final class WindowManager: ObservableObject {
         let frame = LayoutEngine.visibleFrameInCG(for: screen)
         if let previousFrame = dragDisplayFrame,
            previousFrame != frame {
-            let sourceWindows = AXBridge.tiledWindows(
-                on: previousFrame,
-                floatApps: config.floatApps
-            )
-            .map(\.element)
-            .filter {
-                AXBridge.pid(of: $0) != ProcessInfo.processInfo.processIdentifier
-                    && !floatingWindows.contains($0)
-                    && $0 != dragged
+            let sourceScreen = DisplayTracker.currentDisplays().first {
+                LayoutEngine.visibleFrameInCG(for: $0) == previousFrame
             }
+            let sourceWindows = sourceScreen.map {
+                orderedWindows(on: previousFrame, screen: $0)
+                    .filter { $0 != dragged }
+            } ?? []
             animateTiles(sourceWindows, in: previousFrame, duration: dragAnimationDuration)
 
-            dragOrder = AXBridge.tiledWindows(on: frame, floatApps: config.floatApps)
-                .map(\.element)
-                .filter {
-                    AXBridge.pid(of: $0) != ProcessInfo.processInfo.processIdentifier
-                        && !floatingWindows.contains($0)
-                }
+            dragOrder = orderedWindows(on: frame, screen: screen)
             dragOriginalOrder = dragOrder
             dragPreviewIndex = dragOrder.firstIndex(of: dragged)
+            dragCandidateIndex = nil
+            dragCandidateSamples = 0
             dragHasValidDrop = false
             dragDisplayFrame = frame
             if isDebugEnabled {
@@ -305,16 +388,32 @@ final class WindowManager: ObservableObject {
             currentIndex: currentIndex
         ) else {
             dragHasValidDrop = false
+            dragCandidateIndex = nil
+            dragCandidateSamples = 0
             return
         }
         dragHasValidDrop = true
-        guard targetIndex != currentIndex else { return }
+        guard targetIndex != currentIndex else {
+            dragCandidateIndex = nil
+            dragCandidateSamples = 0
+            return
+        }
+
+        if dragCandidateIndex == targetIndex {
+            dragCandidateSamples += 1
+        } else {
+            dragCandidateIndex = targetIndex
+            dragCandidateSamples = 1
+        }
+        guard dragCandidateSamples >= 3 else { return }
 
         var reordered = dragOrder
         reordered.remove(at: currentIndex)
         reordered.insert(dragged, at: min(targetIndex, reordered.count))
         dragOrder = reordered
         dragPreviewIndex = targetIndex
+        dragCandidateIndex = nil
+        dragCandidateSamples = 0
         if isDebugEnabled {
             mwLog("minimalWM: drag preview slot=\(targetIndex)")
         }
@@ -377,11 +476,17 @@ final class WindowManager: ObservableObject {
     }
 
     private func resetDragState() {
+        dragPollTimer?.invalidate()
+        dragPollTimer = nil
         dragWindow = nil
+        dragPID = 0
+        dragLastFrame = nil
         dragOrder = []
         dragOriginalOrder = []
         dragDisplayFrame = nil
         dragPreviewIndex = nil
+        dragCandidateIndex = nil
+        dragCandidateSamples = 0
         dragHasValidDrop = false
     }
 
@@ -390,6 +495,7 @@ final class WindowManager: ObservableObject {
         frameAnimationTimer = nil
         animationStates.removeAll()
         animationWindows.removeAll()
+        animationPIDs.removeAll()
         suppressUntil = 0
     }
 
@@ -406,6 +512,13 @@ final class WindowManager: ObservableObject {
         let now = CFAbsoluteTimeGetCurrent()
         guard let dragged = dragWindow else { return }
 
+        // AX move notifications can pause while the user is still holding the
+        // title bar. Never commit a drop based on notification silence alone.
+        guard !isPrimaryMouseButtonDown() else {
+            scheduleQuietCheck(interval: dragQuietInterval)
+            return
+        }
+
         // Still receiving moves — keep waiting for the drop.
         if now - lastMoveTime < 0.05 {
             scheduleQuietCheck(interval: 0.1)
@@ -413,6 +526,10 @@ final class WindowManager: ObservableObject {
         }
 
         handleDrop(of: dragged)
+    }
+
+    private func isPrimaryMouseButtonDown() -> Bool {
+        CGEventSource.buttonState(.combinedSessionState, button: .left)
     }
 
     private func handleDrop(of dragged: AXUIElement) {
@@ -433,12 +550,7 @@ final class WindowManager: ObservableObject {
         }
         let frame = LayoutEngine.visibleFrameInCG(for: screen)
 
-        var tiled = AXBridge.tiledWindows(on: frame, floatApps: config.floatApps)
-            .map { $0.element }
-            .filter {
-                AXBridge.pid(of: $0) != ProcessInfo.processInfo.processIdentifier
-                    && !floatingWindows.contains($0)
-            }
+        var tiled = orderedWindows(on: frame, screen: screen)
 
         guard tiled.contains(dragged) else {
             tileAll()
@@ -458,6 +570,7 @@ final class WindowManager: ObservableObject {
             }
         }
 
+        persistOrder(tiled, for: screen)
         tileGeneration &+= 1
         animateTiles(tiled, in: frame, duration: dragAnimationDuration)
         if isDebugEnabled {
@@ -492,6 +605,7 @@ final class WindowManager: ObservableObject {
 
         let targetWindows = Set(targets.map(\.0))
         animationWindows = targetWindows
+        animationPIDs = Set(targetWindows.map(AXBridge.pid(of:)))
         for window in Array(animationStates.keys) where !targetWindows.contains(window) {
             animationStates.removeValue(forKey: window)
         }
@@ -504,6 +618,7 @@ final class WindowManager: ObservableObject {
                 animationStates[window] = WindowAnimationState(
                     frame: current,
                     lastWrittenFrame: current,
+                    lastWriteAt: 0,
                     velocity: .zero,
                     sizeVelocity: .zero,
                     target: target
@@ -517,6 +632,16 @@ final class WindowManager: ObservableObject {
 
         guard frameAnimationTimer == nil else { return }
 
+        animationStartedAt = CFAbsoluteTimeGetCurrent()
+        lastAnimationTickAt = animationStartedAt
+        animationTickCount = 0
+        animationWriteCount = 0
+        animationSlowTickCount = 0
+        animationWriteTime = 0
+        if isDebugEnabled {
+            mwLog("minimalWM: animation started windows=\(targets.count) targetDurationMs=\(Int(duration * 1000))")
+        }
+
         let animationTimer = Timer(timeInterval: frameAnimationInterval, repeats: true) {
             [weak self] timer in
             guard let self else {
@@ -524,26 +649,89 @@ final class WindowManager: ObservableObject {
                 return
             }
 
-            let dt = min(self.frameAnimationInterval, 0.033)
-            let stiffness: CGFloat = 720
-            let damping: CGFloat = 42
+            let tickStartedAt = CFAbsoluteTimeGetCurrent()
+            let tickInterval = tickStartedAt - self.lastAnimationTickAt
+            self.lastAnimationTickAt = tickStartedAt
+            self.animationTickCount += 1
+            if tickInterval > 0.0167 {
+                self.animationSlowTickCount += 1
+            }
+
+            // Accessibility writes can block the main run loop. Advance by
+            // actual elapsed time so the spring remains time-consistent.
+            let dt = min(max(tickInterval, self.frameAnimationInterval), 0.033)
+            // A critically damped spring gives a fast, elastic response while
+            // avoiding visible bounce when a target changes mid-flight.
+            let stiffness: CGFloat = 625
+            let damping: CGFloat = 50 // 2 * sqrt(stiffness)
+            // Size changes use a softer spring so an app has time to redraw
+            // its content as its bounds change, instead of visibly snapping.
+            let sizeStiffness: CGFloat = 400
+            let sizeDamping: CGFloat = 40 // 2 * sqrt(sizeStiffness)
             var settled = true
 
             for (window, var state) in self.animationStates {
-                let dx = state.target.origin.x - state.frame.origin.x
-                let dy = state.target.origin.y - state.frame.origin.y
-                let dw = state.target.width - state.frame.width
-                let dh = state.target.height - state.frame.height
+                let previousFrame = state.frame
+                let (x, vx) = springStep(
+                    value: state.frame.origin.x,
+                    velocity: state.velocity.dx,
+                    target: state.target.origin.x,
+                    stiffness: stiffness,
+                    damping: damping,
+                    dt: dt
+                )
+                let (y, vy) = springStep(
+                    value: state.frame.origin.y,
+                    velocity: state.velocity.dy,
+                    target: state.target.origin.y,
+                    stiffness: stiffness,
+                    damping: damping,
+                    dt: dt
+                )
+                let (width, widthVelocity) = springStep(
+                    value: state.frame.width,
+                    velocity: state.sizeVelocity.width,
+                    target: state.target.width,
+                    stiffness: sizeStiffness,
+                    damping: sizeDamping,
+                    dt: dt
+                )
+                let (height, heightVelocity) = springStep(
+                    value: state.frame.height,
+                    velocity: state.sizeVelocity.height,
+                    target: state.target.height,
+                    stiffness: sizeStiffness,
+                    damping: sizeDamping,
+                    dt: dt
+                )
 
-                state.velocity.dx += (stiffness * dx - damping * state.velocity.dx) * dt
-                state.velocity.dy += (stiffness * dy - damping * state.velocity.dy) * dt
-                state.frame.origin.x += state.velocity.dx * dt
-                state.frame.origin.y += state.velocity.dy * dt
+                state.frame.origin.x = x
+                state.frame.origin.y = y
+                state.frame.size.width = width
+                state.frame.size.height = height
+                state.velocity = CGVector(dx: vx, dy: vy)
+                state.sizeVelocity = CGSize(width: widthVelocity, height: heightVelocity)
 
-                state.sizeVelocity.width += (stiffness * dw - damping * state.sizeVelocity.width) * dt
-                state.sizeVelocity.height += (stiffness * dh - damping * state.sizeVelocity.height) * dt
-                state.frame.size.width += state.sizeVelocity.width * dt
-                state.frame.size.height += state.sizeVelocity.height * dt
+                state.frame.origin.x = clampedSpringValue(
+                    previous: previousFrame.origin.x,
+                    value: state.frame.origin.x,
+                    target: state.target.origin.x
+                )
+                state.frame.origin.y = clampedSpringValue(
+                    previous: previousFrame.origin.y,
+                    value: state.frame.origin.y,
+                    target: state.target.origin.y
+                )
+                state.frame.size.width = clampedSpringValue(
+                    previous: previousFrame.width,
+                    value: state.frame.width,
+                    target: state.target.width
+                )
+                state.frame.size.height = clampedSpringValue(
+                    previous: previousFrame.height,
+                    value: state.frame.height,
+                    target: state.target.height
+                )
 
                 let positionDistance = hypot(
                     state.target.origin.x - state.frame.origin.x,
@@ -570,22 +758,95 @@ final class WindowManager: ObservableObject {
                     abs(state.lastWrittenFrame.width - state.frame.width),
                     abs(state.lastWrittenFrame.height - state.frame.height)
                 )
-                if writeDelta > 1 {
-                    AXBridge.setFrame(window, to: state.frame)
+                let now = CFAbsoluteTimeGetCurrent()
+                // Limit synchronous AX writes to about 30 Hz per window. The
+                // spring remains continuous while the main run loop stays
+                // responsive to drag events.
+                let canWrite = now - state.lastWriteAt >= 1.0 / 30.0
+                if writeDelta > 0.75 && canWrite {
+                    let writeStartedAt = CFAbsoluteTimeGetCurrent()
+                    let sizeDelta = max(
+                        abs(state.lastWrittenFrame.width - state.frame.width),
+                        abs(state.lastWrittenFrame.height - state.frame.height)
+                    )
+                    AXBridge.setFrame(
+                        window,
+                        to: state.frame,
+                        writeSize: sizeDelta > 1.5,
+                        reinforcePosition: false
+                    )
+                    self.animationWriteTime += CFAbsoluteTimeGetCurrent() - writeStartedAt
+                    self.animationWriteCount += 1
                     state.lastWrittenFrame = state.frame
+                    state.lastWriteAt = now
                 }
                 self.animationStates[window] = state
             }
 
             if settled {
+                for (window, state) in self.animationStates {
+                    let finalDelta = max(
+                        abs(state.lastWrittenFrame.origin.x - state.target.origin.x),
+                        abs(state.lastWrittenFrame.origin.y - state.target.origin.y),
+                        abs(state.lastWrittenFrame.width - state.target.width),
+                        abs(state.lastWrittenFrame.height - state.target.height)
+                    )
+                    if finalDelta > 0.5 {
+                        AXBridge.setFrame(window, to: state.target)
+                    }
+                }
+                let elapsed = CFAbsoluteTimeGetCurrent() - self.animationStartedAt
+                if isDebugEnabled {
+                    let averageTickMs = self.animationTickCount > 0
+                        ? (elapsed / Double(self.animationTickCount)) * 1000
+                        : 0
+                    let averageWriteMs = self.animationWriteCount > 0
+                        ? (self.animationWriteTime / Double(self.animationWriteCount)) * 1000
+                        : 0
+                    mwLog(
+                        "minimalWM: animation settled elapsedMs=\(Int(elapsed * 1000)) " +
+                        "ticks=\(self.animationTickCount) avgTickMs=\(String(format: "%.2f", averageTickMs)) " +
+                        "slowTicks=\(self.animationSlowTickCount) writes=\(self.animationWriteCount) " +
+                        "avgWriteMs=\(String(format: "%.2f", averageWriteMs))"
+                    )
+                }
                 timer.invalidate()
                 self.frameAnimationTimer = nil
                 self.animationStates.removeAll()
                 self.animationWindows.removeAll()
+                self.animationPIDs.removeAll()
             }
         }
         frameAnimationTimer = animationTimer
         RunLoop.main.add(animationTimer, forMode: .common)
+    }
+
+    private func clampedSpringValue(
+        previous: CGFloat,
+        value: CGFloat,
+        target: CGFloat
+    ) -> CGFloat {
+        let wasBeforeTarget = previous < target
+        let crossedTarget = wasBeforeTarget ? value > target : value < target
+        return crossedTarget ? target : value
+    }
+
+    private func springStep(
+        value: CGFloat,
+        velocity: CGFloat,
+        target: CGFloat,
+        stiffness: CGFloat,
+        damping: CGFloat,
+        dt: CGFloat
+    ) -> (value: CGFloat, velocity: CGFloat) {
+        let displacement = target - value
+        let acceleration = stiffness * displacement - damping * velocity
+        let nextVelocity = velocity + acceleration * dt
+        let nextValue = value + nextVelocity * dt
+        return (
+            clampedSpringValue(previous: value, value: nextValue, target: target),
+            nextVelocity
+        )
     }
 
     private func layoutNeedsUpdate(
@@ -664,6 +925,77 @@ final class WindowManager: ObservableObject {
 
     // MARK: - Private
 
+    private func orderedWindows(on frame: CGRect, screen: NSScreen) -> [AXUIElement] {
+        let discovered = AXBridge.tiledWindows(on: frame, floatApps: config.floatApps)
+            .filter {
+                AXBridge.pid(of: $0.element) != ProcessInfo.processInfo.processIdentifier
+                    && !floatingWindows.contains($0.element)
+            }
+
+        // Some apps, including Ghostty, can expose identical or empty window
+        // titles and no AXIdentifier. Keep each AX window as a distinct item
+        // instead of collapsing multiple terminal windows into one key.
+        var seenKeys = Set<ManagedWindowKey>()
+        let uniqueDiscovered = discovered.filter { item in
+            seenKeys.insert(windowKey(for: item.element)).inserted
+        }
+        let currentKeys = uniqueDiscovered.map { windowKey(for: $0.element) }
+        let currentSet = Set(currentKeys)
+        let displayKey = displayIdentifier(for: screen)
+        var order = displayOrders[displayKey, default: []]
+
+        for (key, element) in zip(currentKeys, uniqueDiscovered.map(\.element)) {
+            displayElements[key] = element
+        }
+
+        let existing = order.filter { currentSet.contains($0) }
+        let newKeys = currentKeys.filter { !order.contains($0) }
+        order = newKeys + existing
+        displayOrders[displayKey] = order
+
+        return order.compactMap { displayElements[$0] }
+    }
+
+    private func windowKey(for window: AXUIElement) -> ManagedWindowKey {
+        let identifier = AXBridge.identifier(of: window)
+        let identity: String
+        if let identifier, !identifier.isEmpty {
+            // Ghostty currently publishes the same AXIdentifier
+            // (TerminalWindowRestoration) for every terminal window. Include
+            // the AX element identity for that duplicated identifier so
+            // sibling windows remain separate logical entries.
+            if identifier == "TerminalWindowRestoration" {
+                identity = "ax:\(identifier):element:\(window.hashValue)"
+            } else {
+                identity = "ax:\(identifier)"
+            }
+        } else {
+            // AXUIElement hash values distinguish sibling windows when an app
+            // does not publish a stable identifier. Unlike title, this does
+            // not change when a tab or document title changes.
+            identity = "element:\(window.hashValue)"
+        }
+        return ManagedWindowKey(
+            pid: AXBridge.pid(of: window),
+            identity: identity,
+            subrole: AXBridge.subrole(window) ?? ""
+        )
+    }
+
+    private func displayIdentifier(for screen: NSScreen) -> String {
+        let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+        return String(number?.uint32Value ?? 0)
+    }
+
+    private func persistOrder(_ windows: [AXUIElement], for screen: NSScreen) {
+        let displayKey = displayIdentifier(for: screen)
+        let keys = windows.map { windowKey(for: $0) }
+        displayOrders[displayKey] = keys
+        for (key, window) in zip(keys, windows) {
+            displayElements[key] = window
+        }
+    }
+
     @discardableResult
     private func applyTiles(_ windows: [AXUIElement], in frame: CGRect, config: Config) -> Bool {
         let tiled = windows.filter { !floatingWindows.contains($0) }
@@ -712,8 +1044,7 @@ final class WindowManager: ObservableObject {
     private func allTiledOnCurrentDisplay() -> [AXUIElement] {
         guard let mainScreen = NSScreen.main else { return [] }
         let frame = LayoutEngine.visibleFrameInCG(for: mainScreen)
-        return AXBridge.tiledWindows(on: frame, floatApps: config.floatApps)
-            .map { $0.element }
+        return orderedWindows(on: frame, screen: mainScreen)
     }
 
     private func neighbors(of current: AXUIElement, direction: Int) -> [AXUIElement] {

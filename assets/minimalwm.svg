@@ -1,0 +1,46 @@
+<svg width="640" height="220" viewBox="0 0 640 220" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">minimalWM logo</title>
+  <desc id="desc">A dark rounded window grid with one master pane and two stack panes.</desc>
+  <defs>
+    <linearGradient id="background" x1="24" y1="18" x2="616" y2="202" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#182238"/>
+      <stop offset="1" stop-color="#0A0F1C"/>
+    </linearGradient>
+    <linearGradient id="master" x1="44" y1="43" x2="352" y2="178" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6EE7F9"/>
+      <stop offset="1" stop-color="#4F7CFF"/>
+    </linearGradient>
+    <linearGradient id="stack" x1="379" y1="43" x2="594" y2="178" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9B8CFF"/>
+      <stop offset="1" stop-color="#5362D9"/>
+    </linearGradient>
+    <filter id="shadow" x="22" y="22" width="596" height="176" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#020617" flood-opacity=".5"/>
+    </filter>
+    <filter id="glow" x="24" y="23" width="578" height="175" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0.28 0 1 0 0 0.63 0 0 1 0 0.98 0 0 0 .28 0"/>
+    </filter>
+  </defs>
+
+  <rect x="24" y="20" width="592" height="180" rx="34" fill="url(#background)"/>
+  <rect x="24.75" y="20.75" width="590.5" height="178.5" rx="33.25" stroke="#94A3B8" stroke-opacity=".16" stroke-width="1.5"/>
+
+  <g filter="url(#shadow)">
+    <rect x="44" y="43" width="308" height="134" rx="17" fill="url(#master)"/>
+    <rect x="370" y="43" width="226" height="61" rx="15" fill="url(#stack)"/>
+    <rect x="370" y="116" width="226" height="61" rx="15" fill="url(#stack)" fill-opacity=".72"/>
+  </g>
+
+  <rect x="44" y="43" width="308" height="134" rx="17" fill="#6EE7F9" fill-opacity=".08" filter="url(#glow)"/>
+  <path d="M68 76H328M68 101H208" stroke="white" stroke-opacity=".34" stroke-width="6" stroke-linecap="round"/>
+  <path d="M68 128H176M68 151H250" stroke="white" stroke-opacity=".2" stroke-width="6" stroke-linecap="round"/>
+
+  <circle cx="395" cy="67" r="5" fill="white" fill-opacity=".68"/>
+  <path d="M414 67H566" stroke="white" stroke-opacity=".3" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="395" cy="140" r="5" fill="white" fill-opacity=".48"/>
+  <path d="M414 140H536" stroke="white" stroke-opacity=".22" stroke-width="6" stroke-linecap="round"/>
+
+  <path d="M570 188C594 188 603 178 603 158" stroke="#6EE7F9" stroke-width="3" stroke-linecap="round" stroke-dasharray="2 8"/>
+  <circle cx="603" cy="158" r="4" fill="#6EE7F9"/>
+</svg>

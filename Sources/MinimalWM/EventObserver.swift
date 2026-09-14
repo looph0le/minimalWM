@@ -10,12 +10,14 @@ struct WindowEvent: @unchecked Sendable {
 final class EventObserver {
     private var observers: [pid_t: AXObserver] = [:]
     private var observedPIDs: Set<pid_t> = []
+    private var observedWindowKeys: Set<String> = []
 
     static let windowChanged = Notification.Name("minimalWM.windowEvent")
 
     private var debounceTimer: Timer?
     private var topologyTimer: Timer?
     private var windowCounts: [pid_t: Int] = [:]
+    private var windowIdentities: [pid_t: Set<Int>] = [:]
     private var workspaceObserverTokens: [NSObjectProtocol] = []
 
     // MARK: - Start / Stop
@@ -38,9 +40,11 @@ final class EventObserver {
         }
         observers.removeAll()
         observedPIDs.removeAll()
+        observedWindowKeys.removeAll()
         debounceTimer?.invalidate()
         topologyTimer?.invalidate()
         windowCounts.removeAll()
+        windowIdentities.removeAll()
         for token in workspaceObserverTokens {
             NSWorkspace.shared.notificationCenter.removeObserver(token)
             NotificationCenter.default.removeObserver(token)
@@ -57,23 +61,36 @@ final class EventObserver {
     }
 
     private func refreshWindowCounts() {
-        windowCounts = Dictionary(
-            uniqueKeysWithValues: AXBridge.runningApps().map { app in
-                (app.processIdentifier, AXBridge.windows(for: app.processIdentifier).count)
-            }
-        )
+        let snapshots = topologySnapshot()
+        windowCounts = snapshots.counts
+        windowIdentities = snapshots.identities
     }
 
     private func checkWindowTopology() {
-        let currentCounts = Dictionary(
-            uniqueKeysWithValues: AXBridge.runningApps().map { app in
-                (app.processIdentifier, AXBridge.windows(for: app.processIdentifier).count)
-            }
-        )
-        guard currentCounts != windowCounts else { return }
+        let snapshot = topologySnapshot()
+        guard snapshot.counts != windowCounts || snapshot.identities != windowIdentities else { return }
 
-        windowCounts = currentCounts
+        windowCounts = snapshot.counts
+        windowIdentities = snapshot.identities
+        for app in AXBridge.runningApps() {
+            registerWindowNotifications(for: app.processIdentifier)
+        }
         post(debounce: 0.05)
+    }
+
+    private func topologySnapshot() -> (
+        counts: [pid_t: Int],
+        identities: [pid_t: Set<Int>]
+    ) {
+        var counts: [pid_t: Int] = [:]
+        var identities: [pid_t: Set<Int>] = [:]
+        for app in AXBridge.runningApps() {
+            let pid = app.processIdentifier
+            let windows = AXBridge.windows(for: pid)
+            counts[pid] = windows.count
+            identities[pid] = Set(windows.map(\.hashValue))
+        }
+        return (counts, identities)
     }
 
     func observe(_ app: NSRunningApplication) {
@@ -114,14 +131,6 @@ final class EventObserver {
             AXObserverAddNotification(observer, appElement, n as CFString, nil)
         }
 
-        // Register window-level notifications on each existing window too.
-        // Some apps deliver moved/resized only on the window element.
-        for window in AXBridge.windows(for: pid) {
-            for n in [kAXWindowMovedNotification, kAXWindowResizedNotification] {
-                AXObserverAddNotification(observer, window, n as CFString, nil)
-            }
-        }
-
         CFRunLoopAddSource(
             CFRunLoopGetMain(),
             AXObserverGetRunLoopSource(observer),
@@ -129,10 +138,25 @@ final class EventObserver {
         )
 
         observers[pid] = observer
+        // Register window-level notifications on each existing window too.
+        // Some apps deliver moved/resized only on the window element.
+        registerWindowNotifications(for: pid)
+    }
+
+    private func registerWindowNotifications(for pid: pid_t) {
+        guard let observer = observers[pid] else { return }
+        for window in AXBridge.windows(for: pid) {
+            let key = "\(pid):\(window.hashValue)"
+            guard observedWindowKeys.insert(key).inserted else { continue }
+            for n in [kAXWindowMovedNotification, kAXWindowResizedNotification] {
+                AXObserverAddNotification(observer, window, n as CFString, nil)
+            }
+        }
     }
 
     private func removeObserver(for pid: pid_t) {
         guard let observer = observers.removeValue(forKey: pid) else { return }
+        observedWindowKeys = observedWindowKeys.filter { !$0.hasPrefix("\(pid):") }
         CFRunLoopRemoveSource(
             CFRunLoopGetMain(),
             AXObserverGetRunLoopSource(observer),
