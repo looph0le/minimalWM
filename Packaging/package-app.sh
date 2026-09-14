@@ -13,8 +13,9 @@ ICON_SVG="$ROOT_DIR/assets/minimalwm-icon.svg"
 rm -rf "$APP" "$ICONSET" "$ARM_BUILD_DIR" "$INTEL_BUILD_DIR"
 mkdir -p "$DIST_DIR" "$ICONSET" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swift build -c release --arch arm64 --scratch-path "$ARM_BUILD_DIR"
-swift build -c release --arch x86_64 --scratch-path "$INTEL_BUILD_DIR"
+SWIFT_COMPAT_FLAGS=(-Xswiftc -swift-version -Xswiftc 5)
+swift build -c release --arch arm64 --scratch-path "$ARM_BUILD_DIR" "${SWIFT_COMPAT_FLAGS[@]}"
+swift build -c release --arch x86_64 --scratch-path "$INTEL_BUILD_DIR" "${SWIFT_COMPAT_FLAGS[@]}"
 ARM_BIN="$ARM_BUILD_DIR/arm64-apple-macosx/release/minimalWM"
 INTEL_BIN="$INTEL_BUILD_DIR/x86_64-apple-macosx/release/minimalWM"
 lipo -create "$ARM_BIN" "$INTEL_BIN" -output "$APP/Contents/MacOS/minimalWM"
