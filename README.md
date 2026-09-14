@@ -7,7 +7,7 @@
 <p align="center">A focused, smooth master-stack tiling window manager for macOS.</p>
 
 <p align="center">
-  <video src="./assets/minimalwm-demo.mp4" autoplay muted loop playsinline controls width="960"></video>
+  <img src="./assets/minimalwm-demo.gif" alt="minimalWM demo" width="960">
 </p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
